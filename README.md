@@ -37,13 +37,11 @@ implementation is a separate crate that plugs into it.
 
 ## Implementations
 
-| Issue | Crate | Description | Status |
-| --- | --- | --- | --- |
-| [#1](https://github.com/jeffparsons/bad-ideas/issues/1) | [`baseline`](crates/baseline) | Array-of-structs native Rust reference | ✅ |
-| [#2](https://github.com/jeffparsons/bad-ideas/issues/2) | [`naive-wasm`](crates/naive-wasm) | Naive Wasm Component (host call per entity per step) | ✅ |
-| [#3](https://github.com/jeffparsons/bad-ideas/issues/3) | [`stream-wasm`](crates/stream-wasm) | Wasm Component with streamed inputs/outputs (one async `stream<entity>` call per step) | ✅ |
-| [#3†](https://github.com/jeffparsons/bad-ideas/issues/3) | [`bulk-wasm`](crates/bulk-wasm) | Bulk comparison: whole `list<entity>` in one call per step (synchronous, no streaming) | ✅ |
-| [#3†](https://github.com/jeffparsons/bad-ideas/issues/3) | [`batched-wasm`](crates/batched-wasm) | Batched comparison: `list<entity>` in fixed-size batches (sweep: 100 / 1000 / 10000), reusing the `bulk-wasm` guest | ✅ |
+- [`baseline`](crates/baseline) — Array-of-structs native Rust reference
+- [`naive-wasm`](crates/naive-wasm) — Naive Wasm Component (host call per entity per step)
+- [`stream-wasm`](crates/stream-wasm) — Wasm Component with streamed inputs/outputs (one async `stream<entity>` call per step)
+- [`bulk-wasm`](crates/bulk-wasm) — Bulk comparison: whole `list<entity>` in one call per step (synchronous, no streaming)
+- [`batched-wasm`](crates/batched-wasm) — Batched comparison: `list<entity>` in fixed-size batches (sweep: 100 / 1000 / 10000), reusing the `bulk-wasm` guest
 
 ## Results
 
