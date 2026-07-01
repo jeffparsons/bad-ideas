@@ -1,5 +1,9 @@
 # bad-ideas
 
+> **AI use disclosure:** the implementations, tooling, and much of this README are
+> largely written by [Claude Code](https://www.anthropic.com/claude-code), under
+> human direction and review.
+
 Exploring how fast we can make a simple ECS (Entity-Component-System) simulation
 using creative approaches — in particular implementing the "systems" part of ECS
 with **Wasm Components**, plus side quests like **Wasm GC** — and understanding
