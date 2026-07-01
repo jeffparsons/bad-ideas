@@ -26,6 +26,9 @@ struct Impl {
     blurb: &'static str,
     /// Optional Wasm guest package to build for `wasm32-wasip2` before running.
     guest: Option<&'static str>,
+    /// Extra environment variables to set when running the binary (e.g. to drive a
+    /// single binary through a parameter sweep).
+    env: &'static [(&'static str, &'static str)],
 }
 
 /// The implementations to build, run, and tabulate, in display order.
@@ -35,24 +38,52 @@ const IMPLEMENTATIONS: &[Impl] = &[
         package: "baseline",
         blurb: "Array-of-structs native reference",
         guest: None,
+        env: &[],
     },
     Impl {
         name: "naive-wasm",
         package: "naive-wasm",
         blurb: "Naive Wasm Component (host call per entity per step)",
         guest: Some("naive-wasm-guest"),
+        env: &[],
     },
     Impl {
         name: "stream-wasm",
         package: "stream-wasm",
         blurb: "Streaming Wasm Component (one async stream<entity> call per step)",
         guest: Some("stream-wasm-guest"),
+        env: &[],
     },
     Impl {
         name: "bulk-wasm",
         package: "bulk-wasm",
-        blurb: "Bulk Wasm Component (one list<entity> call per step)",
+        blurb: "Bulk Wasm Component (whole list<entity> in one call per step)",
         guest: Some("bulk-wasm-guest"),
+        env: &[],
+    },
+    // Batched sweep: the same guest as `bulk-wasm`, driven with different batch
+    // sizes to trace throughput vs calls-per-step. 100k entities means
+    // 1000 / 100 / 10 calls per step respectively.
+    Impl {
+        name: "batched-wasm-100",
+        package: "batched-wasm",
+        blurb: "Batched Wasm Component (list<entity> in batches of 100)",
+        guest: Some("bulk-wasm-guest"),
+        env: &[("BATCH_SIZE", "100")],
+    },
+    Impl {
+        name: "batched-wasm-1000",
+        package: "batched-wasm",
+        blurb: "Batched Wasm Component (list<entity> in batches of 1000)",
+        guest: Some("bulk-wasm-guest"),
+        env: &[("BATCH_SIZE", "1000")],
+    },
+    Impl {
+        name: "batched-wasm-10000",
+        package: "batched-wasm",
+        blurb: "Batched Wasm Component (list<entity> in batches of 10000)",
+        guest: Some("bulk-wasm-guest"),
+        env: &[("BATCH_SIZE", "10000")],
     },
 ];
 
@@ -95,7 +126,14 @@ fn build_release(root: &Path) {
         "cargo build --release",
     );
 
+    // Several impls can share a guest (e.g. the batched sweep reuses bulk's guest),
+    // so build each distinct guest only once.
+    let mut built: Vec<&str> = Vec::new();
     for guest in IMPLEMENTATIONS.iter().filter_map(|imp| imp.guest) {
+        if built.contains(&guest) {
+            continue;
+        }
+        built.push(guest);
         println!("Building guest '{guest}' (release, wasm32-wasip2)...");
         run_checked(
             Command::new("cargo")
@@ -117,10 +155,12 @@ fn run_impl(root: &Path, imp: &Impl) {
     println!("Running '{}'...", imp.name);
     let bin = root.join("target").join("release").join(imp.package);
     // Run from the workspace root so `results/<name>.json` lands in the right place.
-    run_checked(
-        Command::new(&bin).current_dir(root),
-        &format!("{} benchmark", imp.name),
-    );
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(root);
+    for (key, val) in imp.env {
+        cmd.env(key, val);
+    }
+    run_checked(&mut cmd, &format!("{} benchmark", imp.name));
 }
 
 fn run_checked(cmd: &mut Command, what: &str) {

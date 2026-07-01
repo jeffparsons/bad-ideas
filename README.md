@@ -42,7 +42,8 @@ implementation is a separate crate that plugs into it.
 | [#1](https://github.com/jeffparsons/bad-ideas/issues/1) | [`baseline`](crates/baseline) | Array-of-structs native Rust reference | ✅ |
 | [#2](https://github.com/jeffparsons/bad-ideas/issues/2) | [`naive-wasm`](crates/naive-wasm) | Naive Wasm Component (host call per entity per step) | ✅ |
 | [#3](https://github.com/jeffparsons/bad-ideas/issues/3) | [`stream-wasm`](crates/stream-wasm) | Wasm Component with streamed inputs/outputs (one async `stream<entity>` call per step) | ✅ |
-| [#3†](https://github.com/jeffparsons/bad-ideas/issues/3) | [`bulk-wasm`](crates/bulk-wasm) | Bulk comparison: one `list<entity>` call per step (synchronous, no streaming) | ✅ |
+| [#3†](https://github.com/jeffparsons/bad-ideas/issues/3) | [`bulk-wasm`](crates/bulk-wasm) | Bulk comparison: whole `list<entity>` in one call per step (synchronous, no streaming) | ✅ |
+| [#3†](https://github.com/jeffparsons/bad-ideas/issues/3) | [`batched-wasm`](crates/batched-wasm) | Batched comparison: `list<entity>` in fixed-size batches (sweep: 100 / 1000 / 10000), reusing the `bulk-wasm` guest | ✅ |
 
 ## Results
 
@@ -59,10 +60,13 @@ _Measured on:_
 <!-- BENCH_TABLE:START -->
 | Implementation | Entities | Steps | Fastest | Mean | Throughput | Checksum |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Array-of-structs native reference (`baseline`) | 100,000 | 1,000 | 83.65 ms | 83.88 ms | 1195.4 M/s | -69.2070479314134 |
-| Naive Wasm Component (host call per entity per step) (`naive-wasm`) | 100,000 | 1,000 | 30458.82 ms | 30466.00 ms | 3.3 M/s | -69.2070479314134 |
-| Streaming Wasm Component (one async stream<entity> call per step) (`stream-wasm`) | 100,000 | 1,000 | 2652.32 ms | 2841.82 ms | 37.7 M/s | -69.2070479314134 |
-| Bulk Wasm Component (one list<entity> call per step) (`bulk-wasm`) | 100,000 | 1,000 | 1440.39 ms | 1462.27 ms | 69.4 M/s | -69.2070479314134 |
+| Array-of-structs native reference (`baseline`) | 100,000 | 1,000 | 83.85 ms | 83.99 ms | 1192.7 M/s | -69.2070479314134 |
+| Naive Wasm Component (host call per entity per step) (`naive-wasm`) | 100,000 | 1,000 | 30930.76 ms | 31115.26 ms | 3.2 M/s | -69.2070479314134 |
+| Streaming Wasm Component (one async stream<entity> call per step) (`stream-wasm`) | 100,000 | 1,000 | 2716.49 ms | 2720.77 ms | 36.8 M/s | -69.2070479314134 |
+| Bulk Wasm Component (whole list<entity> in one call per step) (`bulk-wasm`) | 100,000 | 1,000 | 1464.73 ms | 1495.22 ms | 68.3 M/s | -69.2070479314134 |
+| Batched Wasm Component (list<entity> in batches of 100) (`batched-wasm-100`) | 100,000 | 1,000 | 1761.13 ms | 1762.27 ms | 56.8 M/s | -69.2070479314134 |
+| Batched Wasm Component (list<entity> in batches of 1000) (`batched-wasm-1000`) | 100,000 | 1,000 | 1429.63 ms | 1434.34 ms | 69.9 M/s | -69.2070479314134 |
+| Batched Wasm Component (list<entity> in batches of 10000) (`batched-wasm-10000`) | 100,000 | 1,000 | 1410.28 ms | 1411.27 ms | 70.9 M/s | -69.2070479314134 |
 
 <!-- BENCH_TABLE:END -->
 
