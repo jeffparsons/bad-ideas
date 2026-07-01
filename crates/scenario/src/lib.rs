@@ -18,7 +18,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 /// Number of independent entities in the simulation.
-pub const ENTITY_COUNT: usize = 100_000;
+pub const ENTITY_COUNT: usize = 10_000;
 /// Number of integration steps to compute and measure.
 pub const STEPS: usize = 1000;
 /// Integration timestep, in seconds.

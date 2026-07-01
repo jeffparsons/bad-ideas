@@ -24,7 +24,7 @@ cross-checked via a shared checksum.
 
 ## The scenario
 
-- 100,000 independent entities in 2D.
+- 10,000 independent entities in 2D.
 - Each entity stores position and velocity (`2×f32` each); acceleration is derived.
 - Deterministic initial state: every float seeded from a fixed PRNG in `[-1, 1)`.
 - Integration step (`dt = 0.01s`, semi-implicit Euler): accelerate toward the
@@ -41,7 +41,7 @@ implementation is a separate crate that plugs into it.
 - [`naive-wasm`](crates/naive-wasm) — Naive Wasm Component (host call per entity per step)
 - [`stream-wasm`](crates/stream-wasm) — Wasm Component with streamed inputs/outputs (one async `stream<entity>` call per step)
 - [`bulk-wasm`](crates/bulk-wasm) — Bulk comparison: whole `list<entity>` in one call per step (synchronous, no streaming)
-- [`batched-wasm`](crates/batched-wasm) — Batched comparison: `list<entity>` in fixed-size batches (sweep: 100 / 1000 / 10000), reusing the `bulk-wasm` guest
+- [`batched-wasm`](crates/batched-wasm) — Batched comparison: `list<entity>` in fixed-size batches (sweep: 10 / 100 / 1000), reusing the `bulk-wasm` guest
 
 ## Results
 
@@ -58,13 +58,13 @@ _Measured on:_
 <!-- BENCH_TABLE:START -->
 | Implementation | Entities | Steps | Fastest | Mean | Throughput | Checksum |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Array-of-structs native reference (`baseline`) | 100,000 | 1,000 | 83.85 ms | 83.99 ms | 1192.7 M/s | -69.2070479314134 |
-| Naive Wasm Component (host call per entity per step) (`naive-wasm`) | 100,000 | 1,000 | 30930.76 ms | 31115.26 ms | 3.2 M/s | -69.2070479314134 |
-| Streaming Wasm Component (one async stream<entity> call per step) (`stream-wasm`) | 100,000 | 1,000 | 2716.49 ms | 2720.77 ms | 36.8 M/s | -69.2070479314134 |
-| Bulk Wasm Component (whole list<entity> in one call per step) (`bulk-wasm`) | 100,000 | 1,000 | 1464.73 ms | 1495.22 ms | 68.3 M/s | -69.2070479314134 |
-| Batched Wasm Component (list<entity> in batches of 100) (`batched-wasm-100`) | 100,000 | 1,000 | 1761.13 ms | 1762.27 ms | 56.8 M/s | -69.2070479314134 |
-| Batched Wasm Component (list<entity> in batches of 1000) (`batched-wasm-1000`) | 100,000 | 1,000 | 1429.63 ms | 1434.34 ms | 69.9 M/s | -69.2070479314134 |
-| Batched Wasm Component (list<entity> in batches of 10000) (`batched-wasm-10000`) | 100,000 | 1,000 | 1410.28 ms | 1411.27 ms | 70.9 M/s | -69.2070479314134 |
+| Array-of-structs native reference (`baseline`) | 10,000 | 1,000 | 8.93 ms | 10.43 ms | 1120.3 M/s | 124.66134234151104 |
+| Naive Wasm Component (host call per entity per step) (`naive-wasm`) | 10,000 | 1,000 | 3080.67 ms | 3084.03 ms | 3.2 M/s | 124.66134234151104 |
+| Streaming Wasm Component (one async stream<entity> call per step) (`stream-wasm`) | 10,000 | 1,000 | 266.88 ms | 268.04 ms | 37.5 M/s | 124.66134234151104 |
+| Bulk Wasm Component (whole list<entity> in one call per step) (`bulk-wasm`) | 10,000 | 1,000 | 144.26 ms | 144.37 ms | 69.3 M/s | 124.66134234151104 |
+| Batched Wasm Component (list<entity> in batches of 10) (`batched-wasm-10`) | 10,000 | 1,000 | 513.70 ms | 514.32 ms | 19.5 M/s | 124.66134234151104 |
+| Batched Wasm Component (list<entity> in batches of 100) (`batched-wasm-100`) | 10,000 | 1,000 | 176.92 ms | 177.17 ms | 56.5 M/s | 124.66134234151104 |
+| Batched Wasm Component (list<entity> in batches of 1000) (`batched-wasm-1000`) | 10,000 | 1,000 | 141.55 ms | 141.88 ms | 70.6 M/s | 124.66134234151104 |
 
 <!-- BENCH_TABLE:END -->
 
@@ -72,6 +72,10 @@ _Measured on:_
 > A matching _checksum_ means two implementations computed the same final state.
 > These numbers are machine-specific — see the environment block above for what
 > produced the committed results.
+>
+> `naive-wasm` runs with fewer warmup/timed repeats (1 / 2) than the others (2 / 5):
+> a single run makes millions of guest calls so it's comparatively slow, but its
+> timing is stable enough that fewer repeats give the same result.
 
 ## Regenerating the results
 

@@ -45,7 +45,9 @@ const IMPLEMENTATIONS: &[Impl] = &[
         package: "naive-wasm",
         blurb: "Naive Wasm Component (host call per entity per step)",
         guest: Some("naive-wasm-guest"),
-        env: &[],
+        // A single run is comparatively slow (millions of guest calls) but its
+        // timing is very stable, so fewer warmup/timed repeats suffice.
+        env: &[("BENCH_WARMUPS", "1"), ("BENCH_REPEATS", "2")],
     },
     Impl {
         name: "stream-wasm",
@@ -62,8 +64,16 @@ const IMPLEMENTATIONS: &[Impl] = &[
         env: &[],
     },
     // Batched sweep: the same guest as `bulk-wasm`, driven with different batch
-    // sizes to trace throughput vs calls-per-step. 100k entities means
-    // 1000 / 100 / 10 calls per step respectively.
+    // sizes to trace throughput vs calls-per-step. With 10k entities these are
+    // 1000 / 100 / 10 calls per step respectively (batch == entity count would just
+    // reproduce `bulk-wasm`).
+    Impl {
+        name: "batched-wasm-10",
+        package: "batched-wasm",
+        blurb: "Batched Wasm Component (list<entity> in batches of 10)",
+        guest: Some("bulk-wasm-guest"),
+        env: &[("BATCH_SIZE", "10")],
+    },
     Impl {
         name: "batched-wasm-100",
         package: "batched-wasm",
@@ -77,13 +87,6 @@ const IMPLEMENTATIONS: &[Impl] = &[
         blurb: "Batched Wasm Component (list<entity> in batches of 1000)",
         guest: Some("bulk-wasm-guest"),
         env: &[("BATCH_SIZE", "1000")],
-    },
-    Impl {
-        name: "batched-wasm-10000",
-        package: "batched-wasm",
-        blurb: "Batched Wasm Component (list<entity> in batches of 10000)",
-        guest: Some("bulk-wasm-guest"),
-        env: &[("BATCH_SIZE", "10000")],
     },
 ];
 

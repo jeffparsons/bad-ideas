@@ -1,12 +1,12 @@
 {
   "name": "naive-wasm",
-  "entity_count": 100000,
+  "entity_count": 10000,
   "steps": 1000,
-  "warmups": 2,
-  "repeats": 5,
-  "durations_ns": [31616431958, 31037638958, 30972832500, 31018655291, 30930758959],
-  "min_ns": 30930758959,
-  "mean_ns": 31115263533.2,
-  "entity_steps_per_sec": 3233027.6839489825,
-  "checksum": -69.2070479314134
+  "warmups": 1,
+  "repeats": 2,
+  "durations_ns": [3087387917, 3080668000],
+  "min_ns": 3080668000,
+  "mean_ns": 3084027958.5,
+  "entity_steps_per_sec": 3246049.233477934,
+  "checksum": 124.66134234151104
 }

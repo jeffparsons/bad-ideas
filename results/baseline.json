@@ -1,12 +1,12 @@
 {
   "name": "baseline",
-  "entity_count": 100000,
+  "entity_count": 10000,
   "steps": 1000,
   "warmups": 2,
   "repeats": 5,
-  "durations_ns": [84367250, 83859000, 83862166, 83846625, 84004917],
-  "min_ns": 83846625,
-  "mean_ns": 83987991.6,
-  "entity_steps_per_sec": 1192653848.6194286,
-  "checksum": -69.2070479314134
+  "durations_ns": [12627791, 11014792, 10223792, 9346708, 8926458],
+  "min_ns": 8926458,
+  "mean_ns": 10427908.2,
+  "entity_steps_per_sec": 1120265171.2470949,
+  "checksum": 124.66134234151104
 }

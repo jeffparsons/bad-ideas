@@ -1,12 +1,12 @@
 {
   "name": "batched-wasm-1000",
-  "entity_count": 100000,
+  "entity_count": 10000,
   "steps": 1000,
   "warmups": 2,
   "repeats": 5,
-  "durations_ns": [1439244708, 1429632375, 1441308334, 1431609667, 1429929334],
-  "min_ns": 1429632375,
-  "mean_ns": 1434344883.6,
-  "entity_steps_per_sec": 69948052.20467955,
-  "checksum": -69.2070479314134
+  "durations_ns": [141813500, 141652792, 141553958, 142446417, 141948791],
+  "min_ns": 141553958,
+  "mean_ns": 141883091.6,
+  "entity_steps_per_sec": 70644439.34517182,
+  "checksum": 124.66134234151104
 }
