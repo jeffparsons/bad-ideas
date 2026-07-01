@@ -1,0 +1,14 @@
+[package]
+name = "stream-wasm-guest"
+version = "0.1.0"
+edition = "2021"
+
+# Built for wasm32-wasip2, which links with wasm-component-ld and therefore emits a
+# Wasm Component directly. The `async` feature enables wit-bindgen's built-in
+# component-model async reactor (streams/futures), which drives the exported
+# async `advance`.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { workspace = true, features = ["async", "async-spawn"] }

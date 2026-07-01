@@ -1,9 +1,11 @@
 [package]
-name = "naive-wasm"
+name = "stream-wasm"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+futures = { workspace = true }
 scenario = { workspace = true }
 wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }

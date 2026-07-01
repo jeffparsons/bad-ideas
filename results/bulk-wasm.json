@@ -1,0 +1,12 @@
+{
+  "name": "bulk-wasm",
+  "entity_count": 100000,
+  "steps": 1000,
+  "warmups": 2,
+  "repeats": 5,
+  "durations_ns": [1452788625, 1453323334, 1464151042, 1440391958, 1500682041],
+  "min_ns": 1440391958,
+  "mean_ns": 1462267400,
+  "entity_steps_per_sec": 69425547.29259326,
+  "checksum": -69.2070479314134
+}

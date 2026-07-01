@@ -42,6 +42,18 @@ const IMPLEMENTATIONS: &[Impl] = &[
         blurb: "Naive Wasm Component (host call per entity per step)",
         guest: Some("naive-wasm-guest"),
     },
+    Impl {
+        name: "stream-wasm",
+        package: "stream-wasm",
+        blurb: "Streaming Wasm Component (one async stream<entity> call per step)",
+        guest: Some("stream-wasm-guest"),
+    },
+    Impl {
+        name: "bulk-wasm",
+        package: "bulk-wasm",
+        blurb: "Bulk Wasm Component (one list<entity> call per step)",
+        guest: Some("bulk-wasm-guest"),
+    },
 ];
 
 const ENV_START: &str = "<!-- BENCH_ENV:START -->";

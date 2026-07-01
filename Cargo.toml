@@ -8,6 +8,15 @@ default-members = ["crates/*"]
 
 # Make sure the "release" numbers we report are actually optimized. Applies to
 # every implementation in the workspace so the comparison stays apples-to-apples.
+[workspace.dependencies]
+# Central version pins; member crates use `{ workspace = true }`.
+scenario = { path = "crates/scenario" }
+anyhow = "1"
+wasmtime = "46"
+wasmtime-wasi = "46"
+futures = "0.3"
+wit-bindgen = "0.58"
+
 [profile.release]
 opt-level = 3
 lto = true

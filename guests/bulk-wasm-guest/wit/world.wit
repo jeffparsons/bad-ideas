@@ -1,0 +1,17 @@
+package bad-ideas:bulk@0.1.0;
+
+interface sim {
+  record entity {
+    px: f32,
+    py: f32,
+    vx: f32,
+    vy: f32,
+  }
+
+  // Advance a whole batch of entities by one integration step of `dt` seconds.
+  advance: func(entities: list<entity>, dt: f32) -> list<entity>;
+}
+
+world guest {
+  export sim;
+}

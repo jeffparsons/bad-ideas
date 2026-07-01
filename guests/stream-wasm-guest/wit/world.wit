@@ -1,0 +1,18 @@
+package bad-ideas:streaming@0.1.0;
+
+interface sim {
+  record entity {
+    px: f32,
+    py: f32,
+    vx: f32,
+    vy: f32,
+  }
+
+  // Advance a whole stream of entities by one integration step of `dt` seconds:
+  // read the input stream, integrate each entity, produce the output stream.
+  advance: async func(input: stream<entity>, dt: f32) -> stream<entity>;
+}
+
+world guest {
+  export sim;
+}
