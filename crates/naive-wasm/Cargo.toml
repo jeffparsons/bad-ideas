@@ -1,0 +1,9 @@
+[package]
+name = "naive-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.103"
+scenario = { path = "../scenario" }
+wasmtime = "46.0.1"

@@ -1,0 +1,12 @@
+[package]
+name = "naive-wasm-guest"
+version = "0.1.0"
+edition = "2021"
+
+# Built for wasm32-wasip2, which links with wasm-component-ld and therefore emits a
+# Wasm Component directly.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"

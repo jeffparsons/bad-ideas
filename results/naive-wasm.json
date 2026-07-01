@@ -1,0 +1,12 @@
+{
+  "name": "naive-wasm",
+  "entity_count": 100000,
+  "steps": 1000,
+  "warmups": 2,
+  "repeats": 5,
+  "durations_ns": [30548935500, 30382716708, 30377136792, 30390637416, 30369739000],
+  "min_ns": 30369739000,
+  "mean_ns": 30413833083.2,
+  "entity_steps_per_sec": 3292751.3799180165,
+  "checksum": -69.2070479314134
+}

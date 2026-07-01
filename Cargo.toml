@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "guests/*"]
+# Bare `cargo build` / `cargo test` build only the host crates. Wasm guests are
+# built explicitly for the wasm32-wasip2 target (by xtask / scripts/bench.sh); they
+# aren't meaningful when compiled for the host, so keep them out of default builds.
+default-members = ["crates/*"]
 
 # Make sure the "release" numbers we report are actually optimized. Applies to
 # every implementation in the workspace so the comparison stays apples-to-apples.

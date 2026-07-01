@@ -24,14 +24,25 @@ struct Impl {
     package: &'static str,
     /// Human-readable description for the README table.
     blurb: &'static str,
+    /// Optional Wasm guest package to build for `wasm32-wasip2` before running.
+    guest: Option<&'static str>,
 }
 
 /// The implementations to build, run, and tabulate, in display order.
-const IMPLEMENTATIONS: &[Impl] = &[Impl {
-    name: "baseline",
-    package: "baseline",
-    blurb: "Array-of-structs native reference",
-}];
+const IMPLEMENTATIONS: &[Impl] = &[
+    Impl {
+        name: "baseline",
+        package: "baseline",
+        blurb: "Array-of-structs native reference",
+        guest: None,
+    },
+    Impl {
+        name: "naive-wasm",
+        package: "naive-wasm",
+        blurb: "Naive Wasm Component (host call per entity per step)",
+        guest: Some("naive-wasm-guest"),
+    },
+];
 
 const ENV_START: &str = "<!-- BENCH_ENV:START -->";
 const ENV_END: &str = "<!-- BENCH_ENV:END -->";
@@ -64,13 +75,30 @@ fn workspace_root() -> PathBuf {
 }
 
 fn build_release(root: &Path) {
-    println!("Building workspace (release)...");
+    println!("Building host crates (release)...");
     run_checked(
         Command::new("cargo")
             .args(["build", "--release"])
             .current_dir(root),
         "cargo build --release",
     );
+
+    for guest in IMPLEMENTATIONS.iter().filter_map(|imp| imp.guest) {
+        println!("Building guest '{guest}' (release, wasm32-wasip2)...");
+        run_checked(
+            Command::new("cargo")
+                .args([
+                    "build",
+                    "--release",
+                    "--target",
+                    "wasm32-wasip2",
+                    "-p",
+                    guest,
+                ])
+                .current_dir(root),
+            &format!("cargo build guest {guest}"),
+        );
+    }
 }
 
 fn run_impl(root: &Path, imp: &Impl) {
