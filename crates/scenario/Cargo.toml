@@ -1,0 +1,9 @@
+[package]
+name = "scenario"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free: the PRNG, checksum, and JSON serialization are all
+# hand-rolled so that every implementation (native, Wasm Component, Wasm GC, ...)
+# starts from a byte-identical initial state and shares one chartable result format.
+[dependencies]
