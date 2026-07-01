@@ -4,10 +4,19 @@
 > largely written by [Claude Code](https://www.anthropic.com/claude-code), under
 > human direction and review.
 
-Exploring how fast we can make a simple ECS (Entity-Component-System) simulation
-using creative approaches — in particular implementing the "systems" part of ECS
-with **Wasm Components**, plus side quests like **Wasm GC** — and understanding
-where the performance limits actually come from.
+**How fast can ECS go when the "systems" run in [Wasm Components](https://component-model.bytecodealliance.org/)?**
+
+Wasm Components are the thing I actually want here — for the ergonomics and the
+use cases they unlock (portable, sandboxed, language-agnostic systems you can mix
+and match at runtime). The going-in assumption is that this will be *pretty damn
+slow* next to an everything-native approach; the boundary-crossing overhead is
+real and inherent. This experiment isn't about pretending that cost away — it's
+about seeing **how good we can make it anyway**: which tricks close the gap, how
+far they get us, and exactly where the remaining limits come from.
+
+So we start with a boring native baseline to measure against, then push on the
+Wasm Component approaches (with side quests like **Wasm GC**) and see how close we
+can get.
 
 Every implementation runs the *same* fixed scenario, from the *same* deterministic
 initial state, so the numbers are directly comparable and correctness can be
