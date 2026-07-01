@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+# Dev tooling: orchestrates the benchmark run and regenerates the README tables.
+# Kept dependency-free (like the rest of the workspace) by hand-parsing our own
+# small, fixed results JSON format.
+[dependencies]
