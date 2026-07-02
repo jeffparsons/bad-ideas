@@ -27,13 +27,13 @@ receives" cells are both *lift*. Two operations, four surfaces.
 ### Representation is a separate, per-slot choice — mix freely
 
 "Bulk" is **not** the definition of a transfer; it is one *representation* a slot can use.
-Each slot independently picks how it is lowered or lifted, so a single call mixes flat and
+Each slot independently picks how it is lowered or lifted, so a single call mixes bulk and
 dynamic in both directions (the `demo_mixed_pipeline` does exactly this). Two dual
 vocabularies capture the choice:
 
 - **provide** (lower) a value from a **`Source`**:
   - `Flat(&[u8])` — the caller already holds the canonical (CABI-encoded) bytes; copied in
-    as one `memcpy`. This covers a whole `list<flat T>` **and a single pre-lowered
+    as one `memcpy`. This covers a whole `list<inline T>` **and a single pre-lowered
     value/record** — arity comes from the slot type, so it is not list-only.
   - `Val` — a dynamic value walked element-by-element (general/slow).
   - *(future)* `Lazy` — defer the copy to a pull *during* the call (§5); slots in here.
@@ -46,9 +46,9 @@ methods** (you decide how to take the value at the moment you take it — and ma
 same slot more than one way). That mirrors reality: you can't lower what you haven't
 described, but you can lift an already-materialised value however you like.
 
-The **flat** path is offered only where the type is provably flat: a fixed CABI layout with
+The **bulk** path is offered only where the type is provably *inline*: a fixed CABI layout with
 no transitive strings, lists, resources, handles, or other pointer/ownership-bearing values.
-(In the sim, `Ty::is_flat` is that gate; `Ty::String`/`Ty::Handle` exist purely to be
+(In the sim, `Ty::is_inline` is that gate; `Ty::String`/`Ty::Handle` exist purely to be
 rejected by it.) Anything else falls back to `Val`, per slot — which is why "combine bulk
 AND dynamic" is the default, not a special case.
 
@@ -61,7 +61,7 @@ vocabularies.
 
 ## 2. Where the costs fall (the table #13 asked for)
 
-The "nontrivial operations" involved in moving a `list<flat T>` of *M* elements across the
+The "nontrivial operations" involved in moving a `list<inline T>` of *M* elements across the
 boundary, and **who pays them and how often**, under three schemes:
 
 - **A — dynamic `Val`s:** `Func::call(&[Val])`, everything reflected at run time.
@@ -70,7 +70,7 @@ boundary, and **who pays them and how often**, under three schemes:
 
 | Nontrivial operation | A: dynamic `Val`s | B: `bindgen!` | C: prepared + bound flat |
 | --- | --- | --- | --- |
-| **Shape validation** (arg matches the param interface type) | Wasmtime, **per element, per call** — walks the `Val` tree | compiler, **compile time** — types encode it | Wasmtime, **once at `prepare`** — validate shape + prove `T` flat; per call only a cheap len/stride check |
+| **Shape validation** (arg matches the param interface type) | Wasmtime, **per element, per call** — walks the `Val` tree | compiler, **compile time** — types encode it | Wasmtime, **once at `prepare`** — validate shape + prove `T` inline; per call only a cheap len/stride check |
 | **Host-side encode** of each element into canonical bytes | embedder, **per element, per call** — build a `Val` tree (alloc/box) | generated lowering, **per element, per call** (often optimises toward memcpy) | embedder, **~zero** — the host column already *is* the canonical image (e.g. an ECS `&[Vec2]`) |
 | **Content validation** (bool/char/enum discriminants) | Wasmtime, per element, per call | compiler + per element | Wasmtime, **once**: pure-POD `T` ⇒ none; constrained `T` ⇒ a single validation sweep at bind |
 | **Guest allocation** (`cabi_realloc`) | Wasmtime → guest, per call | per call | per call (or a reused/caller-supplied buffer) |
@@ -121,7 +121,7 @@ the most clarity for the least novelty), and treat `CallShape` as the fallback i
 placeholder; `PreparedImport` would restore the symmetry if we want it.
 
 Whatever the nouns, the honest operations underneath should be named on both sides as
-**lower** / **lift** (with "bulk" as the *flat representation* of each), so the docs can
+**lower** / **lift** (with "bulk" as the single-`memcpy` representation of each), so the docs can
 point at one `Source`/`Lifted` pair for all four cells.
 
 ---
@@ -213,7 +213,7 @@ validation too if a hot guest→host path ever wants it.)
 Lazy value lowering ([component-model#383], likely to become the default) changes **when**
 argument bytes are materialised — pulled on demand *during* the guest call rather than
 copied up front — not the **per-element cost model**. So it is *complementary* to the bulk
-fast path, not a replacement: you still want a flat representation so that when the bytes
+fast path, not a replacement: you still want a bulk representation so that when the bytes
 are pulled, they move as one `memcpy` rather than an element walk.
 
 What this means for the API, concretely:
@@ -274,7 +274,7 @@ forward-compatible with the world we expect.
 1. Treat **lower / lift** as the two operations and **`Source` / `Lifted`** as the two
    reused vocabularies; the four cells are surfaces over that one pair. *Flat* (bulk memcpy,
    incl. a single pre-lowered value) vs *`Val`* is a **per-slot representation choice**, so
-   a call mixes bulk and dynamic freely; the flat path is gated by the reflection check.
+   a call mixes bulk and dynamic freely; the bulk path is gated by the reflection check.
 2. Keep the **prepared-shape / bound-call split** — it exactly matches the once-vs-per-call
    cost frequencies in §2 — but only on the export side, where the host loops; the import
    side chooses representation per call (§4).

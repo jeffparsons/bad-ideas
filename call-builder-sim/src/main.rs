@@ -284,7 +284,7 @@ fn demo_single_element() {
 
 // --- All four cells + every representation, in one pipeline --------------------------
 //
-// A single call that mixes flat and Val on *both* the lowering and lifting sides, in both
+// A single call that mixes bulk and Val on *both* the lowering and lifting sides, in both
 // directions. `scale(pts: list<vec2>, factors: list<f32>) -> (scaled: list<vec2>,
 // mags: list<f32>)`, where the guest forwards everything to a host import:
 //
@@ -384,5 +384,5 @@ fn main() {
     demo_results();
     demo_single_element();
     demo_mixed_pipeline();
-    println!("  OK: every cell matches its native reference, for both flat and Val.");
+    println!("  OK: every cell matches its native reference, for both bulk and Val.");
 }

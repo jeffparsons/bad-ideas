@@ -15,8 +15,7 @@ A living checklist — the design, and its future evolutions, should keep satisf
 item. These goals describe a host that moves component-model values into, out of, and
 *between* guest components generically — including values whose types the guests share but
 the host was never compiled against — always free to pick an efficient representation per
-value. ("*flat*" is defined in the footnote;[^flat] its exact name is
-[under discussion](#the-flat-terminology-question).)
+value. (*inline* is defined [below](#terminology-inline).)
 
 Keywords **MUST** / **SHOULD** / **MAY** follow [RFC 2119]: *MUST* = required; *SHOULD* =
 strongly wanted, pursue unless there's a compelling reason not to; *MAY* = desirable if it
@@ -32,28 +31,28 @@ fits, explicitly not blocking. Each goal has a stable ID (`AREA-n`) for citing e
   MAY mix them into the same call alongside dynamically-supplied ones.
 - **CORE-3 — Host → guest arguments.** The host MUST be able to provide each argument
   independently, mixing within one call: as a dynamic `Val`, or from a byte buffer holding a
-  CABI-encoded *flat* value **or a contiguous array/list** of them.
+  CABI-encoded *inline* value **or a contiguous array/list** of them.
 - **CORE-4 — Host → guest return values.** The host MUST be able to receive each return
   value independently, choosing per value: a borrowed zero-copy view, an owned copy, or a
   dynamic `Val`.
 - **CORE-5 — Guest → host arguments.** When a guest calls a host function, the host MUST be
   able to receive each argument with that same per-value choice (view / copy / `Val`).
 - **CORE-6 — Guest → host return values.** The host MUST be able to provide each return
-  value with that same per-value choice (`Val`, or a CABI-encoded flat value / array).
+  value with that same per-value choice (`Val`, or a CABI-encoded inline value / array).
 - **CORE-7 — Per-value choice.** Representation MUST be selectable per value; the convenient
   dynamic (`Val`) path MUST always be available, with faster representations opt-in only
   where wanted.
 - **CORE-8 — Guest-to-guest conduit.** The host SHOULD be able to pass a value of a shared
-  flat type from one guest to another efficiently — without statically knowing the type, and
+  inline type from one guest to another efficiently — without statically knowing the type, and
   ideally by moving its CABI bytes rather than rebuilding a host-native value.
 
 **Performance**
 
-- **PERF-1 — Bulk fast path.** A flat value or list MUST be transferable as a single
+- **PERF-1 — Bulk fast path.** An inline value or list MUST be transferable as a single
   `memcpy`, not per-element work.
 - **PERF-2 — Validation paid once.** For a call made repeatedly, type/shape validation
   SHOULD be hoisted out of the per-invocation path and reused across invocations.
-- **PERF-3 — Zero-copy reads.** When the host only needs to read guest-produced flat data,
+- **PERF-3 — Zero-copy reads.** When the host only needs to read guest-produced inline data,
   it MAY do so in place, without copying it out.
 - **PERF-4 — Allocation reuse.** The design SHOULD permit reusing guest allocations across
   calls, to bound `cabi_realloc` churn.
@@ -61,7 +60,7 @@ fits, explicitly not blocking. Each goal has a stable ID (`AREA-n`) for citing e
 **Correctness**
 
 - **CORR-1 — Checked, never blind.** A fast path MUST be taken only when the runtime can
-  *prove* from reflected type info that the type is flat; anything else MUST fall back to
+  *prove* from reflected type info that the type is inline; anything else MUST fall back to
   `Val`.
 - **CORR-2 — Representation-independent results.** The result MUST NOT depend on which
   representation was chosen for a value — flat and `Val` are interchangeable for the same
@@ -75,10 +74,14 @@ fits, explicitly not blocking. Each goal has a stable ID (`AREA-n`) for citing e
   the window in which the runtime guarantees them valid.
 - **SAFE-3 — Misuse fails to compile.** Unsound usages (holding a borrow too long, escaping
   a view) MUST be compile errors, not runtime UB.
-- **SAFE-4 — No UB on bad input.** Invalid caller-supplied data — wrong length, non-flat
-  bytes, spec/type mismatch — MUST NOT cause undefined behaviour or silent memory
-  corruption. *(Open: whether such cases are surfaced as recoverable errors or treated as
-  programmer errors that may panic is still being decided.)*
+- **SAFE-4 — No UB on bad input.** Invalid input MUST NOT cause undefined behaviour or
+  silent memory corruption. Failures then split by kind: **structural mismatches** (wrong
+  arity, a flat-bytes spec on a non-inline type) MUST be caught as errors at *prepare/bind*
+  time and validated once, so the hot path need not recheck them; **data-dependent
+  failures** (a byte buffer whose length isn't a whole number of elements, or contents that
+  fail validation) MUST be returned as recoverable errors at *invoke* time; only a contract
+  violation these checks were meant to prevent MAY panic — a programmer error, like an
+  out-of-bounds index.
 
 **Forward-compatibility** *(anticipated; not necessarily implemented yet)*
 
@@ -95,23 +98,24 @@ fits, explicitly not blocking. Each goal has a stable ID (`AREA-n`) for citing e
 
 - **Beating `bindgen!` on raw throughput** for types the host statically knows — where
   generated code applies, it is expected to win; this is about the *dynamic* case.
-- **A fast path for non-flat types** — strings, nested lists, resources, and handles always
-  go through `Val`; only flat types get bulk transfer.
+- **A fast path for non-inline types** — strings, nested lists, resources, and handles
+  always go through `Val`; only inline types get bulk transfer.
 - **A new wire format** — the bytes are exactly the canonical-ABI image, nothing bespoke.
 - **Replacing `Val` or `bindgen`** — this composes with them; it does not supersede them.
 
-### The "flat" terminology question
+### Terminology: "inline"
 
-*flat* is provisional. It reads clearly but collides with the canonical ABI's own use of
-"flattening" (lowering a value to core params), so a different word may be better. Candidates
-under consideration, with prior art: **inline** (Java Valhalla value/inline classes),
-**blittable** (.NET marshalling), **bitwise-copyable** (Swift's `BitwiseCopyable`), **POD** /
-**plain-old-data** (C++), **plain** (bytemuck's `Pod`), **trivially-copyable** (C++). No
-decision yet.
+A component-model type is **inline** when its whole value is stored *inline* — a fixed
+canonical-ABI layout with no *out-of-line* storage or ownership: numbers and records/tuples
+of them, but not strings, nested lists, resources, or handles. "inline" pairs naturally with
+the canonical ABI's own "out-of-line" and, unlike *flat*, doesn't collide with ABI
+*flattening* (lowering a value to core params). Prior art for the concept: Java Valhalla
+inline/value classes, .NET *blittable*, Swift's `BitwiseCopyable`, C++ *trivially-copyable*.
 
-[^flat]: *flat* here means a component-model type with a fixed canonical-ABI layout and no
-    out-of-line storage or ownership — numbers and records/tuples of them, but not strings,
-    nested lists, resources, or handles.
+Kept distinct on purpose is the nearby phrase **flat bytes** — a *flat (contiguous) byte
+buffer* holding a value's pre-encoded canonical image (the `Source::Flat` variant). An
+*inline type* is precisely what makes handing its value over as *flat bytes* legal: the two
+words name the type and the buffer, and are used together deliberately.
 
 [RFC 2119]: https://www.rfc-editor.org/rfc/rfc2119
 
@@ -127,16 +131,16 @@ memory, *not* on the direction of the call:
 | **guest → host** (import call) | host **receives** → *lift* | host **provides** → *lower* |
 
 Crucially, each slot **independently picks its representation** — nothing forces a call to
-be all-flat or all-dynamic; one call mixes them freely, in both directions:
+be all-bulk or all-dynamic; one call mixes them freely, in both directions:
 
-- **provide** (lower) from a `Source`: `Flat(&[u8])` — a pre-encoded CABI image copied as
-  one `memcpy`, covering a whole `list<flat T>` **or a single value/record** — or `Val`,
-  walked element-by-element. (A future `Lazy` slots in here without changing anything else.)
+- **provide** (lower) from a `Source`: `Flat(&[u8])` — a pre-encoded CABI image (flat bytes)
+  copied as one `memcpy`, covering a whole `list<inline T>` **or a single value/record** —
+  or `Val`, walked element-by-element. (A future `Lazy` slots in here unchanged.)
 - **receive** (lift) from a `Lifted` accessor, choosing *at the pull site*: `view`
   (zero-copy borrow), `copy` (owned bytes), or `val` (dynamic).
 
-The flat fast path is offered only where the type is provably flat (fixed CABI layout, no
-strings, nested lists, resources, or handles); everything else falls back to `Val`. So
+The bulk fast path is offered only where the type is provably *inline* (fixed CABI layout,
+no strings, nested lists, resources, or handles); everything else falls back to `Val`. So
 "bulk" is one *representation*, not the definition of a transfer.
 
 The two vocabularies are reused across all four cells:
@@ -147,7 +151,8 @@ The two vocabularies are reused across all four cells:
 | **guest → host** (import) | `ImportCall::set(i, Source)` | `ImportCall::args()` → `Lifted` |
 
 `src/main.rs` exercises every cell against a native reference; the final pipeline mixes
-flat and `Val` on *both* the lower and lift sides, in *both* directions, in a single call.
+bulk and dynamic representations on *both* the lower and lift sides, in *both* directions,
+in a single call.
 
 The full reasoning — the cost table, naming options, and how this survives **lazy value
 lowering** and **async** unchanged — is in [`DESIGN.md`](./DESIGN.md).
@@ -190,7 +195,7 @@ cargo test    # doctests, incl. the two compile_fail borrow-safety proofs
 ## Scope
 
 The whole matrix, with `Flat` + `Val` mixable on both the provide and receive sides in
-both directions, single pre-lowered values as well as `list<flat T>`, in/inout export
+both directions, single pre-lowered values as well as `list<inline T>`, in/inout export
 args, scoped + eager + `val` result reading, and a guest↔host import round trip — plus the
 reuse/borrow proofs. Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy
 (`value.lower`) lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a

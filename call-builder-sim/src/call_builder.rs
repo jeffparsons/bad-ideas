@@ -36,8 +36,8 @@ pub enum Error {
     Arity { expected: usize, got: usize },
     /// An argument's representation didn't match the spec chosen at `prepare` time.
     SpecMismatch { index: usize },
-    /// A flat spec was requested for a non-flat (out-of-line / ownership-bearing) type.
-    NotFlat { index: usize },
+    /// A flat-bytes spec was requested for a non-inline (out-of-line / ownership-bearing) type.
+    NotInline { index: usize },
 }
 
 /// The representation *choice* for one argument — declared at prepare time, carrying no
@@ -103,7 +103,7 @@ impl PreparedCall {
                 ArgSpec::Val => Tier::ValWalk,
                 ArgSpec::FlatIn | ArgSpec::FlatInOut => {
                     if !ty.is_bulk_transferable() {
-                        return Err(Error::NotFlat { index });
+                        return Err(Error::NotInline { index });
                     }
                     Tier::Memcpy
                 }
@@ -207,7 +207,7 @@ impl<'a> BoundCall<'a> {
     }
 
     /// **Host → guest results (lift), eager.** Lower args, run the guest, then copy every
-    /// `list<flat T>` result out into a host-owned `Vec<u8>`. For callers who want to keep
+    /// `list<inline T>` result out into a host-owned `Vec<u8>`. For callers who want to keep
     /// the bytes past the call.
     pub fn invoke_collect(self, store: &mut Store) -> Result<Vec<Vec<u8>>, Error> {
         let result_tys = self.prepared.func.results.clone();
@@ -238,7 +238,7 @@ impl<'a> BoundCall<'a> {
         for (index, (argplan, slot)) in plan.iter().zip(self.slots).enumerate() {
             match (argplan.spec, slot) {
                 // Both non-inout sources go through the one lowering choke point, so a
-                // single flat value flattens by-value exactly like it would on the import
+                // single inline value flattens by-value exactly like it would on the import
                 // result side.
                 (ArgSpec::Val, ArgSource::Val(v)) => {
                     core.extend(lower_source(store, &argplan.ty, Source::Val(v)));

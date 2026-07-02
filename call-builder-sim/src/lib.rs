@@ -12,9 +12,9 @@
 //! Two dual vocabularies are reused across all four cells: a
 //! [`Source`](fake_wasmtime::Source) (`Flat` | `Val`) to *provide* a value, and a
 //! [`Lifted`](fake_wasmtime::Lifted) accessor (`view` | `copy` | `val`) to *receive* one.
-//! Each slot picks its own representation, so one call freely mixes flat and dynamic in
+//! Each slot picks its own representation, so one call freely mixes bulk and dynamic in
 //! both directions. `Source::Flat` also covers a single pre-lowered value, not just
-//! `list<flat T>`.
+//! `list<inline T>`.
 //!
 //! It is not wasmtime; [`fake_wasmtime`] is a tiny stand-in that reproduces the same
 //! borrow structure a real embedding has, so this crate can *prove* — by compiling and

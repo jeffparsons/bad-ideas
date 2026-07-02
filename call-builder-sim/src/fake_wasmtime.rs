@@ -28,7 +28,7 @@ pub(crate) fn align_up(offset: usize, align: usize) -> usize {
     (offset + align - 1) & !(align - 1)
 }
 
-/// A component-model-ish interface type. Includes a couple of deliberately *non-flat*
+/// A component-model-ish interface type. Includes a couple of deliberately *non-inline*
 /// shapes (`String`, `Handle`) so the transferability gate has something to reject.
 #[derive(Clone, Debug)]
 pub enum Ty {
@@ -36,9 +36,9 @@ pub enum Ty {
     U32,
     Record(Vec<Ty>),
     List(Box<Ty>),
-    /// (ptr, len) into memory with out-of-line character storage — *not* flat.
+    /// (ptr, len) into memory with out-of-line character storage — *not* inline.
     String,
-    /// An index into a per-instance table with ownership semantics — *not* flat.
+    /// An index into a per-instance table with ownership semantics — *not* inline.
     Handle,
 }
 
@@ -71,16 +71,16 @@ impl Ty {
         }
     }
 
-    /// "Flat" = a fixed-size, memcpy-transferable byte image with **no out-of-line
+    /// "Inline" = a fixed-size, memcpy-transferable byte image with **no out-of-line
     /// storage and no ownership/pointer-bearing values**: scalars and records thereof.
     ///
     /// This is exactly the gate #13788 relies on: Wasmtime must be able to prove from
-    /// reflected type info that `T` in `list<T>` is flat before the bulk fast path is
+    /// reflected type info that `T` in `list<T>` is inline before the bulk fast path is
     /// legal. `string`, nested `list`, `resource`/handle all fail it.
-    pub fn is_flat(&self) -> bool {
+    pub fn is_inline(&self) -> bool {
         match self {
             Ty::F32 | Ty::U32 => true,
-            Ty::Record(fields) => fields.iter().all(Ty::is_flat),
+            Ty::Record(fields) => fields.iter().all(Ty::is_inline),
             Ty::List(_) | Ty::String | Ty::Handle => false,
         }
     }
@@ -100,12 +100,12 @@ impl Ty {
         }
     }
 
-    /// Can this type participate in a *bulk* flat transfer? For `list<T>` that means the
-    /// element type is flat; a bare scalar/record must itself be flat.
+    /// Can this type participate in a *bulk* transfer? For `list<T>` that means the
+    /// element type is inline; a bare scalar/record must itself be inline.
     pub fn is_bulk_transferable(&self) -> bool {
         match self {
-            Ty::List(elem) => elem.is_flat(),
-            other => other.is_flat(),
+            Ty::List(elem) => elem.is_inline(),
+            other => other.is_inline(),
         }
     }
 }
@@ -126,7 +126,7 @@ pub enum Val {
 /// The representation is chosen per slot, so one call freely mixes them:
 ///
 /// * [`Source::Flat`] — the caller already holds the canonical (CABI-encoded) bytes, and
-///   they are copied in as one `memcpy`. This covers a whole `list<flat T>` **and** a
+///   they are copied in as one `memcpy`. This covers a whole `list<inline T>` (flat bytes) **and** a
 ///   single pre-lowered value/record; the arity comes from the slot's [`Ty`].
 /// * [`Source::Val`] — a dynamic value walked element-by-element (the general/slow path).
 ///
@@ -282,7 +282,7 @@ impl<'a> Caller<'a> {
     ///
     /// * the guest's core args (ptr/len pairs into *its* memory) are wrapped in an
     ///   [`ImportCall`], which lets the host lift borrowed views of them;
-    /// * whatever flat lists the host sets are lowered back into guest memory, and the
+    /// * whatever list results the host sets are lowered back into guest memory, and the
     ///   resulting (ptr, len) core values are handed back to the guest.
     pub fn call_import(&mut self, index: usize, core_args: &[CoreVal]) -> Vec<CoreVal> {
         // Copy the slice reference out so `import` doesn't keep `self` borrowed while we
@@ -349,7 +349,7 @@ impl ImportCall<'_> {
 /// site* — the shared "receive" vocabulary used for both host→guest results and
 /// guest→host params. The same value can be pulled more than one way.
 ///
-/// `view`/`copy` apply to `list<flat T>` slots (a contiguous canonical image); `val`
+/// `view`/`copy` apply to `list<inline T>` slots (a contiguous canonical image); `val`
 /// works for any slot by walking it into a [`Val`].
 pub struct Lifted<'a> {
     store: &'a Store,
@@ -384,11 +384,11 @@ impl<'a> Lifted<'a> {
         )
     }
 
-    /// **Zero-copy** borrowed view of the flat bytes of `list<flat T>` slot `index`. The
+    /// **Zero-copy** borrowed view of the flat bytes of `list<inline T>` slot `index`. The
     /// borrow is tied to `&self`, i.e. to the enclosing scope / handler.
     pub fn view(&self, index: usize) -> &[u8] {
         let ty = &self.tys[index];
-        assert!(ty.is_bulk_transferable(), "slot {index} is not flat-transferable");
+        assert!(ty.is_bulk_transferable(), "slot {index} is not an inline type");
         let (ptr, count) = self.list_ptr_count(index);
         lift_flat_view(self.store, ty, ptr, count)
     }
@@ -399,7 +399,7 @@ impl<'a> Lifted<'a> {
     }
 
     /// Lift slot `index` into a dynamic [`Val`] by walking it element-by-element (the
-    /// general/slow path, and the only one that works for non-flat shapes).
+    /// general/slow path, and the only one that works for non-inline shapes).
     pub fn val(&self, index: usize) -> Val {
         let ty = &self.tys[index];
         let slot = self.slots[index];
@@ -440,7 +440,7 @@ pub(crate) fn core_slot_offsets(tys: &[Ty]) -> Vec<usize> {
     offs
 }
 
-/// **bulk LOWER.** Copy a flat argument's pre-encoded element image into freshly
+/// **bulk LOWER.** Copy an inline argument's pre-encoded element image into freshly
 /// allocated linear memory in one shot. Returns `(ptr, element_count)`. This is the fast
 /// path #13788 asks for, and the shared primitive behind *host->guest params* and
 /// *guest->host results*.
@@ -451,7 +451,7 @@ pub(crate) fn lower_flat(store: &mut Store, ty: &Ty, bytes: &[u8]) -> (usize, us
     (ptr, count)
 }
 
-/// **bulk LIFT (borrowed view).** Borrow `count` flat elements of guest memory in place —
+/// **bulk LIFT (borrowed view).** Borrow `count` inline elements of guest memory in place —
 /// zero copy. The caller controls the dynamic extent in which the view is valid; here
 /// that is enforced structurally by the borrow of `&Store`.
 pub(crate) fn lift_flat_view<'s>(store: &'s Store, ty: &Ty, ptr: usize, count: usize) -> &'s [u8] {
@@ -497,7 +497,7 @@ pub(crate) fn lower_source(store: &mut Store, ty: &Ty, src: Source) -> Vec<CoreV
     core
 }
 
-/// Lower pre-encoded canonical bytes. A `list<flat T>` image is copied into memory as one
+/// Lower pre-encoded canonical bytes. A `list<inline T>` image is copied into memory as one
 /// `memcpy` and represented by (ptr, len); a **single** pre-lowered value/record is
 /// flattened straight into core values, no allocation. Either way the caller skips
 /// building a [`Val`] tree.
