@@ -147,7 +147,7 @@ The two vocabularies are reused across all four cells:
 
 | | provide (lower) | receive (lift) |
 | --- | --- | --- |
-| **host → guest** (export) | `BoundCall::arg_flat_in` / `arg_val` / `arg_flat_inout` | `invoke_scoped(\|r\| …)` / `invoke_collect` |
+| **host → guest** (export) | `BoundCall::arg_flat_in` / `arg_val` / `arg_flat_inout` | `invoke(…)` (owns) / `invoke_scoped(\|r\| …)` (zero-copy) |
 | **guest → host** (import) | `ImportCall::set(i, Source)` | `ImportCall::args()` → `Lifted` |
 
 `src/main.rs` exercises every cell against a native reference; the final pipeline mixes
@@ -200,7 +200,7 @@ cargo test    # doctests, incl. the two compile_fail borrow-safety proofs
 
 The whole matrix, with `Flat` + `Val` mixable on both the provide and receive sides in
 both directions, single pre-lowered values as well as `list<inline T>`, in/inout export
-args, scoped + eager + `val` result reading, and a guest↔host import round trip — plus the
+args, owning + scoped + `val` result reading, and a guest↔host import round trip — plus the
 reuse/borrow proofs. Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy
 (`value.lower`) lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a
 tier-2 validation sweep for `bool`/`enum`. These are noted where they would slot in.

@@ -324,7 +324,7 @@ impl ImportCall<'_> {
     /// arguments. The borrow is tied to `&self`, so the views it yields cannot be retained
     /// across a later [`set`](Self::set) (which needs `&mut self`) or escape the handler.
     pub fn args(&self) -> Lifted<'_> {
-        Lifted::new(self.store, self.param_tys, &self.args)
+        Lifted::new(&self.store.mem, self.param_tys, &self.args)
     }
 
     /// **Guest → host results (lower).** Provide result `index` from any [`Source`] (flat
@@ -352,16 +352,16 @@ impl ImportCall<'_> {
 /// `view` / `copy` / `val` are sugar over `get`, and the same slot may be pulled more than
 /// one way.
 pub struct Lifted<'a> {
-    store: &'a Store,
+    mem: &'a [u8],
     tys: &'a [Ty],
     core: &'a [CoreVal],
     slots: Vec<usize>,
 }
 
 impl<'a> Lifted<'a> {
-    pub(crate) fn new(store: &'a Store, tys: &'a [Ty], core: &'a [CoreVal]) -> Self {
+    pub(crate) fn new(mem: &'a [u8], tys: &'a [Ty], core: &'a [CoreVal]) -> Self {
         Lifted {
-            store,
+            mem,
             tys,
             core,
             slots: core_slot_offsets(tys),
@@ -411,7 +411,7 @@ impl<'a> Lifted<'a> {
         let ty = &self.tys[index];
         assert!(ty.is_bulk_transferable(), "slot {index} is not an inline type");
         let (ptr, count) = self.list_ptr_count(index);
-        lift_flat_view(self.store, ty, ptr, count)
+        lift_flat_view(self.mem, ty, ptr, count)
     }
 
     fn lift_val(&self, index: usize) -> Val {
@@ -424,7 +424,7 @@ impl<'a> Lifted<'a> {
                 let mut items = Vec::with_capacity(count);
                 let mut off = ptr;
                 for _ in 0..count {
-                    items.push(lift_scalar_or_record(self.store, elem, off));
+                    items.push(lift_scalar_or_record(self.mem, elem, off));
                     off += stride;
                 }
                 Val::List(items)
@@ -469,6 +469,38 @@ impl<'a> FromResult<'a> for Val {
     }
 }
 
+/// Results the host **owns** — a copy of the guest's canonical result bytes, produced by
+/// `invoke` (the borrow-free counterpart to `invoke_scoped`). Borrow the standard [`Lifted`]
+/// accessor from it with [`OwnedResults::results`] to read via `get`/`view`/`copy`/`val`.
+///
+/// In a real embedding `invoke` would just return a `Results` value with the same accessor
+/// surface directly; the sim splits it because a struct cannot own bytes *and* hold a borrow
+/// of them at once.
+pub struct OwnedResults {
+    mem: Vec<u8>,
+    tys: Vec<Ty>,
+    core: Vec<CoreVal>,
+}
+
+impl OwnedResults {
+    pub(crate) fn new(mem: Vec<u8>, tys: Vec<Ty>, core: Vec<CoreVal>) -> Self {
+        OwnedResults { mem, tys, core }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tys.is_empty()
+    }
+
+    /// The standard [`Lifted`] accessor over the owned bytes.
+    pub fn results(&self) -> Lifted<'_> {
+        Lifted::new(&self.mem, &self.tys, &self.core)
+    }
+}
+
 /// The starting core-slot index of each parameter, given that a `list`/`string` occupies
 /// two core slots (ptr, len) and every other type occupies one.
 pub(crate) fn core_slot_offsets(tys: &[Ty]) -> Vec<usize> {
@@ -495,12 +527,13 @@ pub(crate) fn lower_flat(store: &mut Store, ty: &Ty, bytes: &[u8]) -> (usize, us
     (ptr, count)
 }
 
-/// **bulk LIFT (borrowed view).** Borrow `count` inline elements of guest memory in place —
-/// zero copy. The caller controls the dynamic extent in which the view is valid; here
-/// that is enforced structurally by the borrow of `&Store`.
-pub(crate) fn lift_flat_view<'s>(store: &'s Store, ty: &Ty, ptr: usize, count: usize) -> &'s [u8] {
+/// **bulk LIFT (borrowed view).** Borrow `count` inline elements of linear memory in place —
+/// zero copy. The caller controls the dynamic extent in which the view is valid; here that
+/// is enforced structurally by the borrow of the memory slice (guest memory, or a host-owned
+/// [`OwnedResults`] copy).
+pub(crate) fn lift_flat_view<'s>(mem: &'s [u8], ty: &Ty, ptr: usize, count: usize) -> &'s [u8] {
     let len = count * ty.elem_size();
-    &store.mem[ptr..ptr + len]
+    &mem[ptr..ptr + len]
 }
 
 /// Lower a `Val` argument by walking it element-by-element. **This is the slow path** we
@@ -604,18 +637,16 @@ fn store_scalar_or_record(store: &mut Store, ty: &Ty, val: &Val, off: usize) {
 
 /// Lift one in-memory value (scalar or record) into a [`Val`] — the inverse of
 /// [`store_scalar_or_record`], used to walk `list<T>` elements into a `Val::List`.
-fn lift_scalar_or_record(store: &Store, ty: &Ty, off: usize) -> Val {
+fn lift_scalar_or_record(mem: &[u8], ty: &Ty, off: usize) -> Val {
     match ty {
-        Ty::F32 => Val::F32(store.read_f32(off)),
-        Ty::U32 => Val::U32(u32::from_le_bytes(
-            store.mem[off..off + 4].try_into().unwrap(),
-        )),
+        Ty::F32 => Val::F32(f32::from_le_bytes(mem[off..off + 4].try_into().unwrap())),
+        Ty::U32 => Val::U32(u32::from_le_bytes(mem[off..off + 4].try_into().unwrap())),
         Ty::Record(fields) => {
             let mut o = off;
             let mut vals = Vec::with_capacity(fields.len());
             for f in fields {
                 o = align_up(o, f.align());
-                vals.push(lift_scalar_or_record(store, f, o));
+                vals.push(lift_scalar_or_record(mem, f, o));
                 o += f.size();
             }
             Val::Record(vals)

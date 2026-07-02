@@ -19,15 +19,16 @@
 //! ## Receiving results
 //!
 //! Guest-owned result memory is only valid between "the guest returned" and "canonical
-//! post-return cleanup". So [`BoundCall::invoke_scoped`] hands a scoped [`Lifted`]
-//! accessor into a closure — the same "receive" vocabulary used on the import side — and
-//! the caller picks `view`/`copy`/`val` per result. [`BoundCall::invoke_collect`] is a
-//! convenience that copies every result out into host-owned `Vec<u8>`.
+//! post-return cleanup". Two peers along the *who owns the bytes* axis:
+//! [`BoundCall::invoke`] is the easy default — it copies the results out and returns an
+//! owning [`OwnedResults`]; [`BoundCall::invoke_scoped`] is the zero-copy opt-in — it hands
+//! a borrowed [`Lifted`] accessor into a closure (the borrows can't escape). Either way you
+//! read via the same `get`/`view`/`copy`/`val` surface.
 
 use std::rc::Rc;
 
 use crate::fake_wasmtime::{
-    lower_flat, lower_source, Caller, CoreVal, Func, Lifted, Source, Store, Ty, Val,
+    lower_flat, lower_source, Caller, CoreVal, Func, Lifted, OwnedResults, Source, Store, Ty, Val,
 };
 
 #[derive(Debug)]
@@ -177,18 +178,28 @@ impl<'a> BoundCall<'a> {
         self.arg(ArgSource::FlatInOut(bytes))
     }
 
-    /// Lower args, run the guest, copy `FlatInOut` regions back. For calls whose results
-    /// you don't need to read (or that return nothing). Consumes `self`.
-    pub fn invoke(self, store: &mut Store) -> Result<(), Error> {
-        let (_core_results, inout) = self.lower_and_run(store)?;
+    /// **Run and own the results.** The easy default: lowers args, runs the guest, copies
+    /// any `FlatInOut` regions back, and returns an [`OwnedResults`] that owns a copy of the
+    /// guest's result bytes (empty for a call that returns nothing). No closure. Consumes
+    /// `self`. For zero-copy reads of hot results, prefer [`invoke_scoped`](Self::invoke_scoped).
+    pub fn invoke(self, store: &mut Store) -> Result<OwnedResults, Error> {
+        let result_tys = self.prepared.func.results.clone();
+        let (core_results, inout) = self.lower_and_run(store)?;
+        // Snapshot the guest bytes the results point into (skip the copy for void calls).
+        let mem = if result_tys.is_empty() {
+            Vec::new()
+        } else {
+            store.mem.clone()
+        };
         copy_back(store, inout);
-        Ok(())
+        Ok(OwnedResults::new(mem, result_tys, core_results))
     }
 
-    /// **Host → guest results (lift), scoped.** Lower args, run the guest, then hand a
+    /// **Run and read the results zero-copy.** Lowers args, runs the guest, then hands a
     /// borrowed [`Lifted`] accessor into `f`. Inside `f` the caller picks `view`/`copy`/
     /// `val` per result; the borrows are valid only for the duration of `f` — they cannot
-    /// escape it, and cleanup / inout copy-back happens after `f` returns.
+    /// escape it, and cleanup / inout copy-back happens after `f` returns. The zero-copy
+    /// counterpart to the owning [`invoke`](Self::invoke).
     pub fn invoke_scoped<R>(
         self,
         store: &mut Store,
@@ -199,22 +210,9 @@ impl<'a> BoundCall<'a> {
         let result_tys = self.prepared.func.results.clone();
         let (core_results, inout) = self.lower_and_run(store)?;
         let out = {
-            let results = Lifted::new(&*store, &result_tys, &core_results);
+            let results = Lifted::new(&store.mem, &result_tys, &core_results);
             f(&results)
         }; // `results` (and its borrowed views) dropped here, before copy-back.
-        copy_back(store, inout);
-        Ok(out)
-    }
-
-    /// **Host → guest results (lift), eager.** Lower args, run the guest, then copy every
-    /// `list<inline T>` result out into a host-owned `Vec<u8>`. For callers who want to keep
-    /// the bytes past the call.
-    pub fn invoke_collect(self, store: &mut Store) -> Result<Vec<Vec<u8>>, Error> {
-        let result_tys = self.prepared.func.results.clone();
-        let (core_results, inout) = self.lower_and_run(store)?;
-        let results = Lifted::new(&*store, &result_tys, &core_results);
-        let out = (0..results.len()).map(|i| results.copy(i)).collect();
-        drop(results);
         copy_back(store, inout);
         Ok(out)
     }

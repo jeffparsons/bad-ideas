@@ -224,18 +224,19 @@ fn demo_results() {
         })
         .unwrap();
 
-    // Eager copy-out: keep the result bytes as host-owned storage.
-    let collected = prepared
+    // Owning invoke: no closure, keep the result bytes as host-owned storage, read them
+    // back through the same accessor.
+    let owned = prepared
         .bind()
         .arg_flat_in(&positions)
-        .invoke_collect(&mut store)
+        .invoke(&mut store)
         .unwrap();
-    let collected_sum = checksum(&collected[0]);
+    let owned_sum = checksum(owned.results().view(0));
 
     assert_eq!(native_sum, scoped_sum, "Q2 scoped view must match native");
     assert_eq!(native_sum, val_sum, "Q2 val-lift must match native");
-    assert_eq!(native_sum, collected_sum, "Q2 copy-out must match native");
-    println!("  [Q2] host->guest results OK  (checksum {scoped_sum}; view == val == copy-out)");
+    assert_eq!(native_sum, owned_sum, "Q2 owning invoke must match native");
+    println!("  [Q2] host->guest results OK  (checksum {scoped_sum}; scoped view == val == owning invoke)");
 }
 
 // --- Single-element, pre-lowered vs dynamic (arity is not just lists) -----------------

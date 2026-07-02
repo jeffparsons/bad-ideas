@@ -183,14 +183,18 @@ freely-returned borrowed result is unsound. Three directions:
    - *Cons:* the guard pins `&mut Store` for as long as it's held, blocking the next call;
      the lifetime threads through caller code; unsound-prone under async (holding across an
      `.await` that runs other guest code).
-3. **Eager copy-out** — `invoke_collect(store) -> Vec<Vec<u8>>`.
-   - *Pros:* trivial; host owns the bytes; no lifetimes.
+3. **Owning invoke** — `invoke(store) -> OwnedResults`; copies the results out, hands back
+   an accessor over host-owned bytes.
+   - *Pros:* trivial; host owns the bytes; no closure; no lifetimes to thread.
    - *Cons:* always copies, even when the host only wanted to fold a checksum.
 
-**Recommendation:** make **(1) the primitive** and layer **(3) on top** for convenience
-(the sim ships both, via the `Lifted` accessor: `invoke_scoped` yields it, `invoke_collect`
-folds `.copy()` over it). Avoid **(2)** as the foundation — it is the one shape that fights
-both reuse and async.
+**Recommendation:** ship **(1) and (3) as peers** along the *who owns the bytes* axis —
+`invoke` (owns, the easy default) and `invoke_scoped` (borrows, zero-copy) — both handing
+back the same `get`/`view`/`copy`/`val` accessor. `invoke` is internally `invoke_scoped` +
+copy-out, but it's a first-class method because the no-closure owning default is the common
+case; naming it `invoke` (not `invoke_scoped`) also gives the `_scoped` suffix a visible
+counterpart to earn its keep. Avoid **(2)** (a returned guard) as the foundation — it is the
+one shape that fights both reuse and async.
 
 The receive vocabulary is **one primitive + optional sugar**, mirroring the arg decision (Q1
 above): `get::<T>(i)` is the primitive — name the sink *type* — with `view` (`&[u8]`),
@@ -310,8 +314,9 @@ forward-compatible with the world we expect.
    side chooses representation per call (§4).
 3. Names: **`PreparedCall` → `.bind()` → `BoundCall` → `.invoke()`**, `CallShape` as the
    fallback if "prepared" stays ambiguous; add **`PreparedImport`** for import-side symmetry.
-4. Results (Q2) and import args (Q3): **scoped borrowed view as the primitive, eager
-   copy-out layered on top**. Avoid the returned-guard shape.
+4. Results (Q2) and import args (Q3): two peers on the *ownership* axis — **`invoke` (owns,
+   default) and `invoke_scoped` (borrows, zero-copy)**, same accessor from both. Avoid the
+   returned-guard shape.
 5. Import results (Q4): ship **hand-over-bytes**, add **fill-a-guest-buffer** for the
    zero-intermediate-copy path.
 6. Design for **borrows held for the whole call** so the same surfaces survive lazy lowering
@@ -331,11 +336,11 @@ data-dependent errors; only a genuine contract violation panics.
 
 **Core surface at a glance** — the minimal set everything else is built from:
 
-- Types: `ArgSpec`, `ArgSource`, `Source`, `PreparedCall`, `BoundCall`, `Results`,
-  `ImportCall`, and the `FromResult` trait.
+- Types: `ArgSpec`, `ArgSource`, `Source`, `PreparedCall`, `BoundCall`, `Results` /
+  `OwnedResults`, `ImportCall`, and the `FromResult` trait.
 - Reflection: `Type::is_cabi_inline`.
 - Provide: `Func::prepare_call` → `PreparedCall::bind` → `BoundCall::arg` →
-  `BoundCall::invoke_scoped` (+ `invoke_scoped_async`).
+  `BoundCall::invoke` (owns) or `invoke_scoped` (zero-copy) (+ async mirrors).
 - Receive: `Results::get::<T>` (+ `Results::len`, and the `FromResult` impls).
 - Import: `Linker::func_new_transfer`, `ImportCall::args`, `ImportCall::set`.
 
@@ -372,14 +377,21 @@ impl PreparedCall { pub fn bind(&self) -> BoundCall<'_>; }
 
 impl<'a> BoundCall<'a> {
     pub fn arg(self, src: ArgSource<'a>) -> Self;                       // provide primitive
-    pub fn invoke_scoped<R>(self, store: impl AsContextMut,             // the general invoke
+    // Two peers on the "who owns the result bytes" axis:
+    pub fn invoke(self, store: impl AsContextMut) -> Result<OwnedResults>;  // owns; no closure (default)
+    pub fn invoke_scoped<R>(self, store: impl AsContextMut,                 // borrows; zero-copy
         f: impl FnOnce(&Results<'_>) -> Result<R>) -> Result<R>;
+    // async mirrors — futures/borrows held across await (FWD-2):
+    pub async fn invoke_async(self, store: impl AsContextMut) -> Result<OwnedResults>;
     pub async fn invoke_scoped_async<R, Fut>(self, store: impl AsContextMut,
-        f: impl FnOnce(&Results<'_>) -> Fut) -> Result<R>              // borrows held across await (FWD-2)
+        f: impl FnOnce(&Results<'_>) -> Fut) -> Result<R>
         where Fut: Future<Output = Result<R>>;
 }
 
-// Receive vocabulary (results and import args).
+// Receive vocabulary. Both accessors share the same surface — `Results<'_>` (borrowed, from
+// invoke_scoped) and `OwnedResults` (owns its copied bytes, from invoke). `invoke` is
+// `invoke_scoped` + copy-out; it's core because the no-closure owning default is the common
+// case, and naming the pair `invoke` / `invoke_scoped` gives `_scoped` a visible counterpart.
 pub trait FromResult<'a>: Sized {                  // impls: &[u8] (view), Vec<u8> (copy), Val
     fn from_result(results: &'a Results<'_>, index: usize) -> Result<Self>;
 }
@@ -387,6 +399,7 @@ impl<'a> Results<'a> {
     pub fn get<'r, T: FromResult<'r>>(&'r self, index: usize) -> Result<T>; // receive primitive
     pub fn len(&self) -> usize;
 }
+impl OwnedResults { /* len + the same get/view/copy/val over its owned bytes */ }
 
 // Import side (guest → host): args lift, results lower.
 impl<T> component::Linker<T> {
@@ -404,13 +417,7 @@ impl ImportCall<'_> {
 impl<'a> BoundCall<'a> {
     pub fn arg_val(self, v: Val) -> Self;                     // arg(ArgSource::Val(v))
     pub fn arg_flat(self, bytes: &'a [u8]) -> Self;           // arg(ArgSource::Flat(bytes))
-    pub fn arg_flat_inout(self, bytes: &'a mut [u8]) -> Self; // arg(ArgSource::FlatInOut(bytes))
-
-    pub fn invoke(self, store: impl AsContextMut) -> Result<()>;        // invoke_scoped(|_| Ok(()))
-    pub fn invoke_collect(self, store: impl AsContextMut)              // scoped: copy every result
-        -> Result<Vec<Vec<u8>>>;                                       //   = |r| (0..r.len()).map(get::<Vec<u8>>)
-    pub async fn invoke_async(self, store: impl AsContextMut)          // invoke_scoped_async(|_| async { Ok(()) })
-        -> Result<()>;
+    pub fn arg_flat_inout(self, bytes: &'a mut [u8]) -> Self; // arg(ArgSource::FlatInOut(bytes)) — DEFERRED
 }
 
 impl<'a> Results<'a> {

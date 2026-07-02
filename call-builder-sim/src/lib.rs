@@ -6,7 +6,7 @@
 //!
 //! | | params (in) | results (out) |
 //! | --- | --- | --- |
-//! | **host → guest** (export) | *provide* via `PreparedCall`/`BoundCall` — lower | *receive* via `invoke_scoped`/`invoke_collect` — lift |
+//! | **host → guest** (export) | *provide* via `PreparedCall`/`BoundCall` — lower | *receive* via `invoke`/`invoke_scoped` — lift |
 //! | **guest → host** (import) | *receive* via [`fake_wasmtime::ImportCall::args`] — lift | *provide* via [`fake_wasmtime::ImportCall::set`] — lower |
 //!
 //! Two dual vocabularies are reused across all four cells, each a *primitive + optional
