@@ -162,7 +162,10 @@ Since the merge of the `Source`/`Lifted` vocabularies (§1), Q1's provide side i
 the same `Source` enum the import result side uses, and its `flat_in`/`val` sources go
 through one `lower_source` choke point — so a single pre-lowered value/record flattens
 by-value identically on both sides. `flat_inout` stays export-only, because "guest mutates a
-host buffer in place" only makes sense for a param the host owns across the call.
+host buffer in place" only makes sense for a param the host owns across the call — and it is
+**deferred from a first implementation**: the Component Model has no in-out params, so it is
+not expressible without caller-supplied buffers ([component-model#369]) or an
+arg-plus-returned-list rewrite. See the caveat in §8.
 
 ### Q2 — host → guest results (lift)
 
@@ -354,10 +357,10 @@ impl component::Type {
 
 // Provide vocabulary (lower) — both enums are core.
 pub enum ArgSpec { Val, Flat, FlatInOut }          // representation, fixed at prepare time
-pub enum ArgSource<'a> {
+pub enum ArgSource<'a> {                           //   (FlatInOut is DEFERRED — see caveat)
     Val(Val),
     Flat(&'a [u8]),                                // pre-encoded CABI bytes: one value OR a list image
-    FlatInOut(&'a mut [u8]),                       // read-write column, copied back after the call
+    FlatInOut(&'a mut [u8]),                       // read-write column, copied back after the call — DEFERRED
 }
 pub enum Source<'a> { Val(Val), Flat(&'a [u8]) }   // provide, import side (no in-out on results)
 
@@ -422,13 +425,34 @@ impl ImportCall<'_> {
 }
 ```
 
+### Caveat — `FlatInOut` is deferred, and not in a first implementation
+
+The Component Model has **no in-out parameters**: arguments are lowered *by value* into the
+guest's memory, and after the call there is no ABI guarantee that region is still valid,
+unmoved, or unfreed. So "mutate the argument in place and read it back" — exactly what
+`FlatInOut` promises — is **not expressible with today's canonical ABI**. A first cut of this
+API would therefore ship only `Val` and `Flat` arguments (plus the whole receive and import
+surface); `FlatInOut` is **omitted until there is a way to use it**. It waits on one of:
+
+- **caller-supplied buffers** ([component-model#369]) — a guest region the host hands in and
+  reads back, the true zero-extra-allocation in-out (dovetails with the "fill-a-guest-buffer"
+  direction in §4 Q4); or
+- expressing the same intent *today* as a normal arg **plus a returned list**
+  (`advance(cols) -> cols`), where the host copies the result back over its source buffer —
+  sound now, but the guest interface must declare the result and the guest typically
+  allocates a fresh result region (the alloc + copy `FlatInOut` exists to avoid).
+
+The sim implements the aspirational (caller-supplied-buffer) flavor so the ergonomics can be
+exercised end-to-end — so read the `arg_flat_inout` lines in the example below as the
+intended *end-state*, not part of v1.
+
 ### Worked example
 
 An ECS-style host driving a physics guest — hot-loop reuse, a zero-copy result read, and a
 host import — all without the host statically knowing the guest's component types. It uses
 the **convenience** methods (`arg_val`, `arg_flat_inout`, `arg_flat`, `set`) where they read
 best; each desugars to the core surface above (the one exception, `r.get(0)`, is the core
-receive primitive itself).
+receive primitive itself). Note `arg_flat_inout` is the deferred surface (caveat above).
 
 ```rust
 #[repr(C)]
