@@ -2,7 +2,7 @@
 name = "call-builder-sim"
 version = "0.1.0"
 edition = "2021"
-description = "A dependency-free sketch of a heterogeneous 'call builder' API for dynamic component calls, modelling the borrow/lifetime story (for bytecodealliance/wasmtime#13788)."
+description = "A dependency-free sketch of the canonical-ABI transfer surfaces (the host<->guest x params/results matrix) for dynamic component calls, modelling the borrow/lifetime story (for bytecodealliance/wasmtime#13788)."
 
 # This empty table makes the crate its own workspace root, so it is fully independent
 # of the surrounding benchmark workspace. Copy this directory anywhere and it compiles.

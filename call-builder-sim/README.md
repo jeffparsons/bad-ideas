@@ -1,73 +1,73 @@
 # call-builder-sim
 
-A tiny, **dependency-free, compiles-and-runs** sketch of a heterogeneous *call-builder*
-API for **dynamic** WebAssembly Component Model calls. It models the design being
+A tiny, **dependency-free, compiles-and-runs** sketch of the **canonical-ABI transfer
+surfaces** for *dynamic* WebAssembly Component Model calls. It models the design being
 discussed in [`bytecodealliance/wasmtime#13788`](https://github.com/bytecodealliance/wasmtime/issues/13788)
-("bulk lowering for `list<flat T>` in dynamic component calls").
+and worked through in [issue #13](https://github.com/jeffparsons/bad-ideas/issues/13).
 
-It is **not** wasmtime. The point isn't performance — it's to answer one specific
-question with real code that the compiler checks:
+It is **not** wasmtime. The point isn't performance — it's to answer, with real code the
+compiler checks, whether the proposed API ergonomics *compose* across the full transfer
+matrix (and whether the *unsafe* usages are compile errors).
 
-> If a reusable "call" lets you supply some arguments as `Val`s and others as flat
-> byte buffers, and you reuse it across many invocations while mutating those buffers
-> in between — **does that actually compose in Rust, or do the lifetimes make it
-> impossible?**
+## The 2×2 matrix
 
-Answer: it composes, and the *unsafe* version is a compile error.
+Every transfer is a **bulk lower** (host bytes → guest memory) or a **bulk lift** (guest
+memory → host bytes/view) of a `list<flat T>` — where `T` is accepted only if Wasmtime can
+prove from reflected type info that it is a fixed-layout POD with no strings, nested lists,
+resources, or handles. Which primitive a slot uses depends on who owns the memory, *not* on
+the direction of the call:
 
-## The idea
+| | params (in) | results (out) |
+| --- | --- | --- |
+| **host → guest** (export call) | bulk **lower** — `PreparedCall` / `BoundCall` | bulk **lift** — `invoke_scoped` / `invoke_collect` |
+| **guest → host** (import call) | bulk **lift** — `ImportCall::arg_list_view` | bulk **lower** — `ImportCall::return_flat_list` |
 
-Dynamic component calls today are all-or-nothing: either fully dynamic
-(`Func::call(&[Val])`, per-element boxing, slow) or fully static (`bindgen!`, fast but
-requires compile-time types). A **call builder** lets each argument pick its own
-representation, so you pay the fast path only where it's hot:
+`src/main.rs` exercises all four quadrants against a native reference; the final pipeline
+threads one value through every quadrant in a single call.
 
-```rust
-prepared
-    .call()
-    .arg_val(Val::F32(dt))            // scalar: a Val is cheap + convenient
-    .arg_flat_inout(&mut positions)   // hot column: one memcpy in, one back
-    .arg_flat_inout(&mut velocities)  // hot column: memcpy
-    .invoke(&mut store)?;
-```
+The full reasoning — the cost table, naming options, and how this survives **lazy value
+lowering** and **async** unchanged — is in [`DESIGN.md`](./DESIGN.md).
 
-## How the borrow story works (the whole point)
+## The borrow story (the original question)
 
-Two objects, and the split is the answer:
+Two objects, and the split is the answer to "how do you reuse a call while mutating its
+argument buffers between invocations?":
 
-- **`Prepared`** — validated once (arity, per-arg tier). Holds **no** buffer borrows and
-  has no lifetime parameter, so you keep it across the whole loop.
-- **`CallBuilder<'a>`** — created fresh per call; borrows the argument buffers for `'a`
-  only, and `invoke(self, …)` **consumes** it, releasing the borrows before the next
-  statement. So between calls the buffers are unborrowed and freely mutable.
+- **`PreparedCall`** — the *shape*: validated once (arity, per-arg tier). Holds **no**
+  buffer borrows and no lifetime parameter, so you keep it across the whole loop.
+- **`BoundCall<'a>`** — the *binding*: created fresh per call via `.bind()`; borrows the
+  argument buffers for `'a` only, and `invoke*` **consumes** it, releasing them before the
+  next statement. So between calls the buffers are unborrowed and freely mutable.
 
-`Store` (the fake linear memory) is a distinct object from the argument buffers, so
-`&mut store` and `&mut positions` borrow independently with no aliasing conflict.
-
-The safety is enforced, not assumed: `src/lib.rs` contains a `compile_fail` doctest
-showing that holding the builder across a mutation of the same buffer does not compile.
+Borrowed *result* views (host→guest results, guest→host params) are confined to a
+Wasmtime-controlled scope and cannot escape it. All of this is enforced, not assumed:
+`src/lib.rs` has three doctests, two of them `compile_fail` — one for holding a binding
+across a buffer mutation, one for letting a scoped result view escape its closure.
 
 ## Mapping to real wasmtime
 
 | here | real wasmtime |
 | --- | --- |
 | `fake_wasmtime::Store` (`mem` + bump `realloc`) | a `Store` + the instance's linear memory + `cabi_realloc` |
-| `fake_wasmtime::Func` (`params` + closure `body`) | a `component::Func` + the compiled guest |
-| `Val` | `component::Val` |
-| `lower_flat` (one memcpy) | the fast path #13788 asks for |
-| `lower_val` (walk element-by-element) | today's `Func::call(&[Val])` |
+| `fake_wasmtime::Func` (`params`/`results`/`imports` + closure `body`) | a `component::Func` + the compiled guest |
+| `fake_wasmtime::HostImport` / `ImportCall` | a `Linker` import + its `Caller`-scoped invocation |
+| `Val` / `lower_val` (walk element-by-element) | `component::Val` / today's `Func::call(&[Val])` |
+| `lower_flat` (one memcpy) / `lift_flat[_view]` | the bulk fast paths #13788 asks for |
 | `ArgSpec` / `Tier` | the "checked-with-a-fast-path" decision, made once |
 
 ## Run it
 
 ```sh
-cargo run     # ECS-style demo; reuses one Prepared plan across steps, matches a native reference
-cargo test    # doctests, incl. the compile_fail proof that misuse doesn't build
+cargo run     # all four quadrants; each matches a native reference
+cargo test    # doctests, incl. the two compile_fail borrow-safety proofs
 ```
 
 ## Scope
 
-A lean spike: `Val` + flat in/inout sources, memcpy vs per-element lowering, and the
-reuse/borrow proof. Deliberately omitted (natural extensions): a streaming/producer arg
-source, a tier-2 validation sweep for `bool`/`enum`, heterogeneous result binding, and an
-eager-vs-lazy (`value.lower`) dual path.
+An initial pass at the whole matrix: `Val` + flat in/inout arg sources, scoped + eager
+result reading, and a guest↔host import round trip — plus the reuse/borrow proofs.
+Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy (`value.lower`)
+lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a tier-2
+validation sweep for `bool`/`enum`. These are noted where they would slot in.
+
+[#12]: https://github.com/jeffparsons/bad-ideas/issues/12
