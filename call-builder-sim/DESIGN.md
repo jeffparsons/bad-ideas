@@ -132,11 +132,27 @@ point at one `Source`/`Lifted` pair for all four cells.
 
 The original prototype. Each arg picks its representation (`Val`, `flat_in`, `flat_inout`),
 validated once; the bound call borrows the buffers for exactly one `invoke`, which consumes
-it. This is settled; the borrow proof is the two `compile_fail` doctests. The only open
-sub-direction is **arg supply style**: fluent builder (`.arg_flat_in(..).arg_val(..)`) vs
-positional array (`.bind(&[Src::FlatIn(a), Src::Val(v)])`). Recommendation: keep the fluent
-builder — it reads well and lets each `arg_*` method carry its own borrow, which is what
-makes the per-arg lifetimes fall out correctly.
+it. This is settled; the borrow proof is the two `compile_fail` doctests.
+
+**Arg supply style — settled.** The primitive is the explicit enum method,
+`bound.arg(ArgSource::Val(v))`; the `arg_val` / `arg_flat_in` / `arg_flat_inout` methods are
+*optional convenience* over it (`arg_val(v)` = `arg(ArgSource::Val(v))`). Rationale:
+
+- The enum keeps the representation choice **explicit at the call site** — which is the point
+  of "you commit to how you provide up front" (§1). An `Into`-style `arg(123i32)` /
+  `arg(&buf)` is rejected: `&[u8]` can't disambiguate *flat bytes to memcpy* from *a list to
+  walk as a `Val`*, and that intent must stay visible.
+- The enum is the natural surface for **programmatic construction** — a generic dispatcher
+  building calls from reflected type info loops over `ArgSource`s (and can take a slice/
+  iterator form), where per-arg fluent methods would force a `match`-and-reassign per step.
+- The sugar is worth keeping for **hand-written, fixed-arity** calls: it strips a nesting
+  layer (`arg_val(Val::i32(1))` vs `arg(ArgSource::Val(Val::i32(1)))`), and the names mirror
+  the variants 1:1 (`ArgSource::FlatIn` ↔ `arg_flat_in`), which aids discovery/learnability.
+  Prefix-first (`arg_*`) is deliberate so the methods cluster in autocomplete.
+
+The same convention applies symmetrically to the receive side (`Lifted::view/copy/val`) and
+to the import surface (`ImportCall::set(i, Source)` with any future `set_val`/`set_flat`
+sugar), so all four cells read the same way.
 
 Since the merge of the `Source`/`Lifted` vocabularies (§1), Q1's provide side is literally
 the same `Source` enum the import result side uses, and its `flat_in`/`val` sources go
