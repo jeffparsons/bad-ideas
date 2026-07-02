@@ -512,3 +512,135 @@ raw canonical bytes; it is never generated against the guest's `vec2`/`list` typ
 yet a hot column still crosses as a single `memcpy` (PERF-1) with its shape validated once
 (PERF-2). The same `Results` accessor and `Source` enum serve results and imports, so all
 four cells read identically.
+
+---
+
+## 9. Growing the API: two stress tests
+
+The point here is not to finalise these features, but to check that the vocabulary of §8
+*extends* to new use cases without reworking the core surfaces — that "the API can grow."
+Both are framed on the **host → guest** flow. Neither needs a redesign; both turn out to be
+*additive*, and one of them (streaming) actively *validates* a choice we already made.
+
+### 9.1 A streaming argument source ([#12])
+
+**Use case.** An argument fed *incrementally* — events, or a column produced on the fly —
+pulled in chunks as the guest reads it, rather than materialised into one buffer up front.
+This models `stream<T>` and is the most lazy-lowering-native source (inherently pull-based).
+
+**Growth — one new `ArgSource` variant + a trait:**
+
+```rust
+pub trait Producer {
+    /// Next chunk of pre-encoded inline elements, or None at end of stream.
+    fn next_chunk(&mut self) -> Option<&[u8]>;
+}
+pub enum ArgSource<'a> {
+    Val(Val),
+    Flat(&'a [u8]),
+    FlatInOut(&'a mut [u8]),          // deferred (§8 caveat)
+    Stream(&'a mut dyn Producer),     // NEW: runtime pulls chunks during the call
+}
+// sugar, as ever: fn arg_stream(self, p: &'a mut dyn Producer) -> Self { self.arg(ArgSource::Stream(p)) }
+```
+
+**The borrow story — the key deliverable, and the punchline.** A `Flat` arg is borrowed for
+the *whole* `invoke` already (we adopted "borrows held for the whole call" for lazy/async in
+§5–6). A `Stream` is borrowed for *exactly the same extent* — the runtime just calls
+`next_chunk()` several times during the call instead of doing one `memcpy`. So:
+
+- **The Prepared/Bound split is unchanged.** `BoundCall<'a>` borrows the producer for `'a`
+  (a `&'a mut`, like `FlatInOut`), and `invoke` consumes the builder, releasing it. Between
+  calls the producer is unborrowed and can be refilled/advanced.
+- **Composition stays sound.** `.arg_val(dt).arg_flat(&pos).arg_stream(&mut events)` — the
+  three borrow independently; no aliasing.
+- Streaming therefore **validates** the whole-call borrow rule rather than straining it: the
+  rule was chosen *so that* lazy/async/stream sources all fit the same shape.
+
+**Sync vs async.** A synchronous sketch pulls all chunks during `invoke` (isolating the
+lifetime question). Real `stream<T>` pulls across await points → `invoke_async`, with the
+producer borrow carried by the future (FWD-2) — again, no new borrow shape.
+
+**Open question (from #12), answered.** A stream *consumed within one call* fits `ArgSource`
+cleanly. A stream that **outlives** the call (a standing channel the guest reads across many
+calls) is a different lifetime — a separate long-lived binding, closer to how `stream<T>`
+readers already work — and should *not* be shoehorned into the per-call builder. The API can
+host both; `ArgSource::Stream` is the within-call one.
+
+### 9.2 Typed buffers: a guest → host → guest conduit ([#15])
+
+**Use case (your framing).** Collect many results from one component instance into a host
+buffer — validating the CM type *once*, then just capacity/append checks — then slice it and
+feed some or all of those values as arguments to *another* instance's call, without
+re-lowering or re-validating at each hop. This is **CORE-8 (guest-to-guest conduit)** and
+**PERF-2 (pay validation once)** realised at the level of *data* rather than *call shape*.
+
+**Growth — one new type that plugs into both vocabularies.** Under the hood it is, as you
+say, "just a `Vec` and some bookkeeping":
+
+```rust
+pub struct TypedBuffer {
+    ty: component::Type,   // element type, checked cabi-inline once at construction
+    bytes: Vec<u8>,        // CABI-encoded elements, back to back
+    len: usize,            // element count
+}
+impl TypedBuffer {
+    pub fn new(ty: component::Type) -> Result<Self>;          // validates ty is cabi-inline, ONCE
+    pub fn len(&self) -> usize;
+    pub fn capacity_elems(&self) -> usize;
+}
+
+// As a RESULT SINK — collect a call's result into it (append; type-id check + capacity, then memcpy):
+impl<'a> Results<'a> { pub fn append_to(&self, index: usize, buf: &mut TypedBuffer) -> Result<()>; }
+
+// As an ARG SOURCE — slice it back into another call (already CABI bytes of the right type):
+pub enum ArgSource<'a> {
+    // …Val / Flat / …
+    Buffer(&'a TypedBuffer, Range<usize>),   // NEW: a checked slice — carries the type-id
+}
+// desugars near-identically to Flat(buf.bytes_for(range)), but the type-id lets prepare/bind
+// "explode on mismatch" if the buffer's element type ≠ the target parameter's element type.
+```
+
+Read the flow end to end:
+
+```rust
+let mut buf = TypedBuffer::new(vec2_ty)?;               // one type check, ever
+for chunk_call in producer_instance_calls {
+    chunk_call.invoke_scoped(&mut store, |r| r.append_to(0, &mut buf))?;   // collect (memcpy in)
+}
+consumer.prepare_call(&store, &[ArgSpec::Flat])?       // feed a slice to another instance
+    .bind()
+    .arg(ArgSource::Buffer(&buf, 0..n))                // memcpy out — no re-encode, no re-validate
+    .invoke(&mut store)?;
+```
+
+**Why it's the data-level dual of `PreparedCall`.** `PreparedCall` validates a *shape* once
+and reuses it across many invocations; a `TypedBuffer` validates a *type* once and reuses the
+lowered *bytes* across many collect/feed operations. That answers #15's "what value in
+pre-lowering into this buffer?": you can also lower `Val`s / native values into a
+`TypedBuffer` up front and replay it into N calls — amortising encoding, not just validation.
+
+**The "checked" part.** The buffer carries its element `Type` (or a cheap unique type-id, or
+an `Arc<PreparedCall>` for the shape-scoped variant #15 muses about). Every `append_to` and
+every `ArgSource::Buffer` checks that id against the slot it's used with, so a buffer built
+for `vec2` can never be silently fed to a call expecting something else — it explodes early
+(SAFE-4: a structural mismatch, caught at bind).
+
+### What the stress tests tell us
+
+- Both features are **purely additive** — a new `ArgSource` variant (+ trait) for #12, a new
+  type straddling the provide/receive vocabularies for #15. The four core surfaces are
+  untouched.
+- #12 **validates** the whole-call borrow rule (§5–6): a stream is just an arg whose lowering
+  is spread across the call, and the rule already covers it.
+- #15 **realises** CORE-8 and PERF-2 at the data level, and slots a `TypedBuffer` in as both
+  a `Buffer` arg source and an `append_to` result sink — the same "one vocabulary, reused"
+  story as the four cells.
+
+Neither is implemented in the sim yet; each would make a good compiles-and-runs follow-up —
+the streaming one to *pin down the borrow story concretely*, the typed-buffer one to exercise
+the collect → slice → feed round trip across two instances.
+
+[#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+[#15]: https://github.com/jeffparsons/bad-ideas/issues/15
