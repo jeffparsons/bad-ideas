@@ -492,6 +492,68 @@ fn demo_stream() {
     println!("  [stream] Val + flat + stream mixed OK  (total {sim_total:.3})");
 }
 
+fn demo_zip_streams() {
+    // Guest: zip_dot(a: stream<vec2>, b: stream<vec2>) -> list<f32>;  total = Σ dot(a[i], b[i]).
+    // Pulls from BOTH streams by handle, in lockstep — the proof that multiple stream args
+    // work: two distinct producers, each borrowed `&mut` for the call, sharing one lifetime.
+    let func = Func::new(
+        vec![list_of_vec2(), list_of_vec2()],
+        vec![Ty::List(Box::new(Ty::F32))],
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
+            let a = core[0].as_i32() as usize;
+            let b = core[1].as_i32() as usize;
+            let mut total = 0.0f32;
+            loop {
+                // `pull` returns owned `(ptr, len)`, so pulling both in one expression is
+                // fine — each borrow of `caller` ends before the next.
+                match (caller.pull(a), caller.pull(b)) {
+                    (Some((pa, la)), Some((pb, lb))) => {
+                        let s = caller.store();
+                        for i in 0..la.min(lb) / 8 {
+                            let (ax, ay) = (s.read_f32(pa + i * 8), s.read_f32(pa + i * 8 + 4));
+                            let (bx, by) = (s.read_f32(pb + i * 8), s.read_f32(pb + i * 8 + 4));
+                            total += ax * bx + ay * by;
+                        }
+                    }
+                    (None, None) => break,
+                    _ => break, // uneven streams — equal here, so unreachable
+                }
+            }
+            let s = caller.store();
+            let out = s.realloc(4, 4);
+            s.write_f32(out, total);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
+        },
+    );
+
+    let a_data = initial(0xa0a0_a0a0);
+    let b_data = initial(0xb0b0_b0b0);
+
+    let mut native_total = 0.0f32;
+    for i in 0..N {
+        let (ax, ay) = (read_f32(&a_data, i * 8), read_f32(&a_data, i * 8 + 4));
+        let (bx, by) = (read_f32(&b_data, i * 8), read_f32(&b_data, i * 8 + 4));
+        native_total += ax * bx + ay * by;
+    }
+
+    let prepared =
+        PreparedCall::new(&func, &[ArgSpec::Stream, ArgSpec::Stream]).unwrap();
+    let mut store = Store::new(N * 8 * 3 + 8192);
+
+    // Two independent producers, each borrowed `&mut` for the call, pulled by handle.
+    let mut pa = ChunkProducer::new(&a_data, 64 * 8);
+    let mut pb = ChunkProducer::new(&b_data, 64 * 8);
+    let sim_total = prepared
+        .bind()
+        .arg_stream(&mut pa)
+        .arg_stream(&mut pb)
+        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
+        .unwrap();
+
+    assert_eq!(native_total, sim_total, "zipped two-stream dot product must match native");
+    println!("  [zip]  two streams pulled by handle OK  (dot {sim_total:.3})");
+}
+
 fn main() {
     println!("call-builder-sim: canonical-ABI transfer matrix ({N} entities)");
     demo_params();
@@ -499,5 +561,6 @@ fn main() {
     demo_single_element();
     demo_mixed_pipeline();
     demo_stream();
+    demo_zip_streams();
     println!("  OK: every cell matches its native reference, for both bulk and Val.");
 }

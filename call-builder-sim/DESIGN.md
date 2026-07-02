@@ -578,6 +578,16 @@ streamed arg's borrow is a genuinely distinct thing the runtime holds across the
 exactly as the design claimed. The per-call builder and the `compile_fail` are unchanged in
 spirit from the flat case.
 
+**Multiple streams.** Two lifetimes separate the two *kinds* of borrow (producers vs. store),
+not the *number* of streams: every producer shares the one `'p`, living in a
+`Vec<&'p mut dyn Producer>`, and the guest addresses them by handle (`caller.pull(0)`,
+`caller.pull(1)`). N distinct producers borrowed for the same `'p` is sound because they
+alias nothing, and the borrow checker even rejects feeding the *same* producer twice
+(`.arg_stream(&mut p).arg_stream(&mut p)` — double `&mut`). The `demo_zip_streams` demo zips
+two independent `stream<vec2>` args into a dot product, matching a native reference. The only
+case wanting genuinely-independent lifetimes is a stream that *outlives* the call — the
+separate long-lived binding above, not multiple per-call streams.
+
 ### 9.2 Typed buffers: a guest → host → guest conduit ([#15])
 
 **Use case (your framing).** Collect many results from one component instance into a host
