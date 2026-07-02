@@ -330,7 +330,7 @@ data-dependent errors; only a genuine contract violation panics.
 
 - Types: `ArgSpec`, `ArgSource`, `Source`, `PreparedCall`, `BoundCall`, `Results`,
   `ImportCall`, and the `FromResult` trait.
-- Reflection: `Type::is_inline`.
+- Reflection: `Type::is_cabi_inline`.
 - Provide: `Func::prepare_call` → `PreparedCall::bind` → `BoundCall::arg` →
   `BoundCall::invoke_scoped` (+ `invoke_scoped_async`).
 - Receive: `Results::get::<T>` (+ `Results::len`, and the `FromResult` impls).
@@ -347,8 +347,9 @@ use wasmtime::component::{self, Val};
 // Reflection gate.
 impl component::Type {
     /// Fixed CABI layout, no out-of-line storage or ownership (no strings, lists,
-    /// resources, handles). The gate that makes the bulk path legal.
-    pub fn is_inline(&self) -> bool;
+    /// resources, handles). The gate that makes the bulk path legal. Named for the
+    /// canonical ABI to disambiguate from unrelated senses of "inline".
+    pub fn is_cabi_inline(&self) -> bool;
 }
 
 // Provide vocabulary (lower) — both enums are core.
