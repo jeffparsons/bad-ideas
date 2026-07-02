@@ -11,17 +11,61 @@ matrix (and whether the *unsafe* usages are compile errors).
 
 ## Design goals
 
-A living checklist — the design (and its evolutions) should keep satisfying every item.
+A living checklist — the design, and its future evolutions, should keep satisfying every
+item. ("*flat*" is defined in the footnote.[^flat])
 
-1. **Mix representations per argument.** A single call can provide each argument
-   differently — e.g. some as dynamic `Val`s, others from CABI-encoded byte buffers.
-2. **Provide pre-encoded values and lists.** An argument that is a *flat*[^flat]
-   component-model type — or a list of that type — can be provided directly from a byte
-   buffer holding a single value or a contiguous array of values already encoded per the
-   canonical ABI.
-3. **No static type knowledge required.** The host can receive and provide CABI-encoded
-   values without *statically* knowing anything about the specific component-model types
-   involved; everything is driven by reflected type information at run time.
+**Dynamic, mixed-representation transfers**
+
+- **No static type knowledge, no required codegen.** The host receives and provides values
+  without *statically* knowing the specific component-model types involved, and without
+  per-type code generation — so it can drive guests whose types it never saw at build time;
+  everything is driven by reflected type information at run time. Where the host *does* have
+  `bindgen`-generated values, it may mix those into the same call alongside dynamic ones.
+- **Host → guest, arguments.** Provide each argument independently, mixing freely within one
+  call: as a dynamic `Val`, or from a byte buffer holding a CABI-encoded *flat* value **or a
+  contiguous array/list** of them.
+- **Host → guest, return values.** Receive each return value independently, choosing per
+  value: a borrowed zero-copy view, an owned copy, or a dynamic `Val`.
+- **Guest → host, arguments.** When a guest calls a host function, the host receives each
+  argument with that same per-value choice (view / copy / `Val`).
+- **Guest → host, return values.** The host provides each return value with that same
+  per-value choice (`Val`, or a CABI-encoded flat value / array).
+- **The choice is per value.** The convenient dynamic (`Val`) path is always available; the
+  faster representations are opt-in, only where wanted.
+
+**Performance**
+
+- **Bulk fast path.** A flat value or list moves as a single `memcpy`, not per-element work.
+- **Validation paid once.** For a call made repeatedly, type/shape validation is hoisted out
+  of the per-invocation path and reused across invocations.
+- **Zero-copy reads** *(if we can — not strictly required).* When the host only needs to
+  read guest-produced flat data, it can do so in place, without copying it out.
+
+**Correctness**
+
+- **Checked, never blind.** A fast path is taken only when the runtime can *prove*, from
+  reflected type info, that the type is flat; anything else falls back to `Val`.
+- **Representation-independent results.** The representation chosen for a value never changes
+  the result — flat and `Val` are interchangeable for the same logical value.
+
+**Safety** *(table stakes — expected of any safe Rust API, listed for completeness)*
+
+- **Borrow-safe reuse.** A prepared call is reusable across invocations while its argument
+  buffers are mutated between calls, enforced by the type system.
+- **Views can't outlive their validity.** Borrowed views into guest memory cannot escape the
+  window in which the runtime guarantees them valid.
+- **Misuse fails to compile.** The unsound usages are compile errors, not runtime UB.
+
+**Forward-compatibility** *(anticipated; not necessarily implemented yet)*
+
+- **Lazy-lowering-ready.** The surfaces and borrow structure work unchanged if lazy value
+  lowering becomes the norm.
+- **Async-ready.** The design extends to async calls — borrows held across `await` — without
+  reshaping the surfaces.
+- **Room for streaming.** A `stream<T>` argument or result can slot in as another
+  representation (see [#12]).
+- **Room for caller-supplied buffers** *(if it fits — not blocking).* The host can write
+  results directly into guest memory, or reuse allocations, with no intermediate copy.
 
 [^flat]: *flat* here means a component-model type with a fixed canonical-ABI layout and no
     out-of-line storage or ownership — numbers and records/tuples of them, but not strings,
