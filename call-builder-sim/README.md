@@ -180,10 +180,14 @@ across a buffer mutation, one for letting a scoped result view escape its closur
 | `fake_wasmtime::Store` (`mem` + bump `realloc`) | a `Store` + the instance's linear memory + `cabi_realloc` |
 | `fake_wasmtime::Func` (`params`/`results`/`imports` + closure `body`) | a `component::Func` + the compiled guest |
 | `fake_wasmtime::HostImport` / `ImportCall` | a `Linker` import + its `Caller`-scoped invocation |
-| `Source` (`Flat`/`Val`) / `Lifted` (`view`/`copy`/`val`) | the provide / receive vocabularies, reused in all four cells |
+| `Source` (`Flat`/`Val`) provide · `Lifted::get::<T>` receive (`view`/`copy`/`val` sugar) | the two reused vocabularies, in all four cells |
 | `Val` / `lower_val` (walk element-by-element) | `component::Val` / today's `Func::call(&[Val])` |
 | `lower_flat` / `lift_flat_view` (one memcpy) | the bulk fast paths #13788 asks for |
 | `ArgSpec` / `Tier` | the export-side "checked-with-a-fast-path" decision, made once |
+
+For a concrete proposal of these as real wasmtime types — `Func::prepare_call`, `BoundCall`,
+`Results::get::<T>`, `Linker::func_new_transfer` — plus a worked ECS example, see
+[`DESIGN.md` §8 (Wasmtime API sketch)](./DESIGN.md).
 
 ## Run it
 

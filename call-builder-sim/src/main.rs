@@ -190,11 +190,15 @@ fn demo_results() {
     let prepared = PreparedCall::new(&func, &[ArgSpec::FlatIn]).unwrap();
     let mut store = Store::new(N * 8 * 2 + 4096);
 
-    // Zero-copy scoped view: read the result without copying it out of guest memory.
+    // Zero-copy scoped view via the receive primitive: name the sink type (`&[u8]`), the
+    // mirror of naming a source value on the provide side.
     let scoped_sum = prepared
         .bind()
         .arg_flat_in(&positions)
-        .invoke_scoped(&mut store, |results| checksum(results.view(0)))
+        .invoke_scoped(&mut store, |results| {
+            let view: &[u8] = results.get(0);
+            checksum(view)
+        })
         .unwrap();
 
     // Same result, lifted as a dynamic `Val` instead (per-element) — proving the receive

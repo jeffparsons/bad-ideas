@@ -40,11 +40,15 @@ vocabularies capture the choice:
 - **receive** (lift) a value from a **`Lifted`** accessor, choosing *at the pull site*:
   `view` (zero-copy borrow), `copy` (owned bytes), or `val` (dynamic).
 
-Note the deliberate asymmetry between the two vocabularies: providing is an **enum bound up
-front** (you must commit to how you supply the bytes), while receiving is an **accessor with
-methods** (you decide how to take the value at the moment you take it — and may take the
-same slot more than one way). That mirrors reality: you can't lower what you haven't
-described, but you can lift an already-materialised value however you like.
+Both sides are **one primitive + optional sugar** — the arg decision (§4 Q1) applied to
+results too. You *provide* by naming a source **value**, `arg(ArgSource)`, and *receive* by
+naming a sink **type**, `get::<T>()` for `T ∈ {&[u8], Vec<u8>, Val}`, with `arg_val`/… and
+`view`/`copy`/`val` as sugar over each. The one residual difference is **forced, not
+chosen**: a source is a *value* because every source lowers to the same thing (bytes in guest
+memory), whereas a sink is a *type* because the three receive modes produce genuinely
+different Rust types (`&[u8]` / `Vec<u8>` / `Val`) that can't share one return. It also
+mirrors reality — you can't lower what you haven't described, but you can lift an
+already-materialised value however you like, even more than one way.
 
 The **bulk** path is offered only where the type is provably *inline*: a fixed CABI layout with
 no transitive strings, lists, resources, handles, or other pointer/ownership-bearing values.
@@ -183,8 +187,15 @@ freely-returned borrowed result is unsound. Three directions:
 **Recommendation:** make **(1) the primitive** and layer **(3) on top** for convenience
 (the sim ships both, via the `Lifted` accessor: `invoke_scoped` yields it, `invoke_collect`
 folds `.copy()` over it). Avoid **(2)** as the foundation — it is the one shape that fights
-both reuse and async. Because the receive vocabulary is an accessor, `view`/`copy`/`val` are
-all available per result at the pull site; no separate result-spec is needed.
+both reuse and async.
+
+The receive vocabulary is **one primitive + optional sugar**, mirroring the arg decision (Q1
+above): `get::<T>(i)` is the primitive — name the sink *type* — with `view` (`&[u8]`),
+`copy` (`Vec<u8>`), and `val` (`Val`) as sugar over it. The choice is made **per result at
+the pull site**, so no shape-time `ResultSpec` exists — and none is wanted: a `View` spec
+would still force a scope, and mixing it with owned results in one `invoke` gets awkward, for
+no gain over deciding at the pull site (the value already exists by then; §1's
+producer/consumer point).
 
 ### Q3 — guest → host params (lift) — `ImportCall::args() -> Lifted`
 
@@ -302,3 +313,170 @@ forward-compatible with the world we expect.
    zero-intermediate-copy path.
 6. Design for **borrows held for the whole call** so the same surfaces survive lazy lowering
    and async unchanged; leave room in `Tier` for a `LazyMemcpy` strategy.
+7. Give both sides **one primitive + optional sugar**: provide with `arg(ArgSource)` (name a
+   source *value*), receive with `get::<T>()` (name a sink *type*), sugar over each. The
+   value-vs-type split is the one forced asymmetry (homogeneous lower, heterogeneous lift).
+
+---
+
+## 8. Wasmtime API sketch
+
+A concrete proposal against `wasmtime::component`, mapping the sim's surfaces to real types.
+Everything fallible returns `Result` per **SAFE-4**: `prepare_call` validates structure once
+(arity + the inline gate); builder methods are infallible; `invoke*` and `get` surface
+data-dependent errors; only a genuine contract violation panics.
+
+**Core surface at a glance** — the minimal set everything else is built from:
+
+- Types: `ArgSpec`, `ArgSource`, `Source`, `PreparedCall`, `BoundCall`, `Results`,
+  `ImportCall`, and the `FromResult` trait.
+- Reflection: `Type::is_inline`.
+- Provide: `Func::prepare_call` → `PreparedCall::bind` → `BoundCall::arg` →
+  `BoundCall::invoke_scoped` (+ `invoke_scoped_async`).
+- Receive: `Results::get::<T>` (+ `Results::len`, and the `FromResult` impls).
+- Import: `Linker::func_new_transfer`, `ImportCall::args`, `ImportCall::set`.
+
+Every other method below is a **convenience** that desugars to a core call (shown inline).
+The two enums (`ArgSource`, `Source`) *are* core — they're the provide vocabulary, not sugar.
+
+```rust
+use wasmtime::component::{self, Val};
+
+// ═══ CORE ═══════════════════════════════════════════════════════════════════
+
+// Reflection gate.
+impl component::Type {
+    /// Fixed CABI layout, no out-of-line storage or ownership (no strings, lists,
+    /// resources, handles). The gate that makes the bulk path legal.
+    pub fn is_inline(&self) -> bool;
+}
+
+// Provide vocabulary (lower) — both enums are core.
+pub enum ArgSpec { Val, Flat, FlatInOut }          // representation, fixed at prepare time
+pub enum ArgSource<'a> {
+    Val(Val),
+    Flat(&'a [u8]),                                // pre-encoded CABI bytes: one value OR a list image
+    FlatInOut(&'a mut [u8]),                       // read-write column, copied back after the call
+}
+pub enum Source<'a> { Val(Val), Flat(&'a [u8]) }   // provide, import side (no in-out on results)
+
+// Shape (reusable, borrow-free — validate once) and per-call binding.
+impl component::Func {
+    pub fn prepare_call(&self, store: impl AsContext, args: &[ArgSpec]) -> Result<PreparedCall>;
+}
+impl PreparedCall { pub fn bind(&self) -> BoundCall<'_>; }
+
+impl<'a> BoundCall<'a> {
+    pub fn arg(self, src: ArgSource<'a>) -> Self;                       // provide primitive
+    pub fn invoke_scoped<R>(self, store: impl AsContextMut,             // the general invoke
+        f: impl FnOnce(&Results<'_>) -> Result<R>) -> Result<R>;
+    pub async fn invoke_scoped_async<R, Fut>(self, store: impl AsContextMut,
+        f: impl FnOnce(&Results<'_>) -> Fut) -> Result<R>              // borrows held across await (FWD-2)
+        where Fut: Future<Output = Result<R>>;
+}
+
+// Receive vocabulary (results and import args).
+pub trait FromResult<'a>: Sized {                  // impls: &[u8] (view), Vec<u8> (copy), Val
+    fn from_result(results: &'a Results<'_>, index: usize) -> Result<Self>;
+}
+impl<'a> Results<'a> {
+    pub fn get<'r, T: FromResult<'r>>(&'r self, index: usize) -> Result<T>; // receive primitive
+    pub fn len(&self) -> usize;
+}
+
+// Import side (guest → host): args lift, results lower.
+impl<T> component::Linker<T> {
+    pub fn func_new_transfer(&mut self, name: &str,
+        f: impl Fn(StoreContextMut<T>, ImportCall<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<&mut Self>;
+}
+impl ImportCall<'_> {
+    pub fn args(&self) -> Results<'_>;                                  // receive (lift)
+    pub fn set(&mut self, index: usize, src: Source<'_>) -> Result<()>; // provide primitive (lower)
+}
+
+// ═══ CONVENIENCE — each desugars to the core call shown ══════════════════════
+
+impl<'a> BoundCall<'a> {
+    pub fn arg_val(self, v: Val) -> Self;                     // arg(ArgSource::Val(v))
+    pub fn arg_flat(self, bytes: &'a [u8]) -> Self;           // arg(ArgSource::Flat(bytes))
+    pub fn arg_flat_inout(self, bytes: &'a mut [u8]) -> Self; // arg(ArgSource::FlatInOut(bytes))
+
+    pub fn invoke(self, store: impl AsContextMut) -> Result<()>;        // invoke_scoped(|_| Ok(()))
+    pub fn invoke_collect(self, store: impl AsContextMut)              // scoped: copy every result
+        -> Result<Vec<Vec<u8>>>;                                       //   = |r| (0..r.len()).map(get::<Vec<u8>>)
+    pub async fn invoke_async(self, store: impl AsContextMut)          // invoke_scoped_async(|_| async { Ok(()) })
+        -> Result<()>;
+}
+
+impl<'a> Results<'a> {
+    pub fn view(&self, i: usize) -> Result<&[u8]>;   // get::<&[u8]>
+    pub fn copy(&self, i: usize) -> Result<Vec<u8>>; // get::<Vec<u8>>
+    pub fn val(&self, i: usize) -> Result<Val>;      // get::<Val>
+}
+
+impl ImportCall<'_> {
+    pub fn set_val(&mut self, index: usize, v: Val) -> Result<()>;        // set(i, Source::Val(v))
+    pub fn set_flat(&mut self, index: usize, bytes: &[u8]) -> Result<()>; // set(i, Source::Flat(bytes))
+}
+```
+
+### Worked example
+
+An ECS-style host driving a physics guest — hot-loop reuse, a zero-copy result read, and a
+host import — all without the host statically knowing the guest's component types. It uses
+the **convenience** methods (`arg_val`, `arg_flat_inout`, `arg_flat`, `set`) where they read
+best; each desugars to the core surface above (the one exception, `r.get(0)`, is the core
+receive primitive itself).
+
+```rust
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Vec2 { x: f32, y: f32 }
+
+// Guest world:
+//   advance:   func(dt: f32, pos: list<vec2>, vel: list<vec2>);
+//   summarise: func(pos: list<vec2>) -> list<f32>;
+//   import gravity: func(pos: list<vec2>) -> list<vec2>;
+
+let advance = instance.get_func(&mut store, "advance").unwrap();
+
+// Prepare ONCE, outside the loop: dt as a Val, the two columns as read-write flat buffers.
+let step = advance.prepare_call(&store, &[ArgSpec::Val, ArgSpec::FlatInOut, ArgSpec::FlatInOut])?;
+
+let mut pos: Vec<Vec2> = initial_positions();
+let mut vel: Vec<Vec2> = initial_velocities();
+
+for _ in 0..STEPS {
+    step.bind()
+        .arg_val(Val::Float32(DT))
+        .arg_flat_inout(bytemuck::cast_slice_mut(&mut pos))   // one memcpy in, one back
+        .arg_flat_inout(bytemuck::cast_slice_mut(&mut vel))
+        .invoke(&mut store)?;
+    // pos/vel are unborrowed and freely mutable again here (SAFE-1).
+}
+
+// Read a result in place — no copy out of guest memory (name the sink type `&[u8]`):
+let summarise = instance.get_func(&mut store, "summarise").unwrap();
+let plan = summarise.prepare_call(&store, &[ArgSpec::Flat])?;
+let total: f32 = plan.bind()
+    .arg_flat(bytemuck::cast_slice(&pos))
+    .invoke_scoped(&mut store, |r| {
+        let mags: &[u8] = r.get(0)?;                          // zero-copy view (PERF-3)
+        Ok(bytemuck::cast_slice::<u8, f32>(mags).iter().sum())
+    })?;
+
+// A host import the guest calls — lift its args, lower our result, mixing per slot:
+linker.root().func_new_transfer("gravity", |_store, mut call| {
+    let field: &[u8] = call.args().get(0)?;                   // lift guest bytes (borrowed)
+    let out: Vec<Vec2> = gravity_of(bytemuck::cast_slice(field));
+    call.set(0, Source::Flat(bytemuck::cast_slice(&out)))?;   // lower host bytes back
+    Ok(())
+})?;
+```
+
+The host only ever names *representations* (`ArgSpec`, `ArgSource`, sink types) and moves
+raw canonical bytes; it is never generated against the guest's `vec2`/`list` types (CORE-1),
+yet a hot column still crosses as a single `memcpy` (PERF-1) with its shape validated once
+(PERF-2). The same `Results` accessor and `Source` enum serve results and imports, so all
+four cells read identically.

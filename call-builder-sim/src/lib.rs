@@ -9,11 +9,12 @@
 //! | **host → guest** (export) | *provide* via `PreparedCall`/`BoundCall` — lower | *receive* via `invoke_scoped`/`invoke_collect` — lift |
 //! | **guest → host** (import) | *receive* via [`fake_wasmtime::ImportCall::args`] — lift | *provide* via [`fake_wasmtime::ImportCall::set`] — lower |
 //!
-//! Two dual vocabularies are reused across all four cells: a
-//! [`Source`](fake_wasmtime::Source) (`Flat` | `Val`) to *provide* a value, and a
-//! [`Lifted`](fake_wasmtime::Lifted) accessor (`view` | `copy` | `val`) to *receive* one.
-//! Each slot picks its own representation, so one call freely mixes bulk and dynamic in
-//! both directions. `Source::Flat` also covers a single pre-lowered value, not just
+//! Two dual vocabularies are reused across all four cells, each a *primitive + optional
+//! sugar*: [`Source`](fake_wasmtime::Source) (`Flat` | `Val`) to *provide* a value — name a
+//! source **value** — and [`Lifted::get`](fake_wasmtime::Lifted::get)`::<T>` to *receive*
+//! one — name a sink **type** (`&[u8]` | `Vec<u8>` | `Val`), with `view`/`copy`/`val` as
+//! sugar. Each slot picks its own representation, so one call freely mixes bulk and dynamic
+//! in both directions. `Source::Flat` also covers a single pre-lowered value, not just
 //! `list<inline T>`.
 //!
 //! It is not wasmtime; [`fake_wasmtime`] is a tiny stand-in that reproduces the same

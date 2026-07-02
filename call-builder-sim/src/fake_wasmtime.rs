@@ -345,12 +345,12 @@ impl ImportCall<'_> {
     }
 }
 
-/// Guest-owned values exposed for **lifting**, with the representation chosen *at the pull
-/// site* — the shared "receive" vocabulary used for both host→guest results and
-/// guest→host params. The same value can be pulled more than one way.
-///
-/// `view`/`copy` apply to `list<inline T>` slots (a contiguous canonical image); `val`
-/// works for any slot by walking it into a [`Val`].
+/// Guest-owned values exposed for **lifting**. The receive primitive is [`Lifted::get`],
+/// which yields a slot as whatever *sink type* you name: `&[u8]` (zero-copy view),
+/// `Vec<u8>` (owned copy), or [`Val`] (dynamic). This is the dual of the provide primitive
+/// `arg(ArgSource)` — there you commit to a source *value*, here you request a sink *type*.
+/// `view` / `copy` / `val` are sugar over `get`, and the same slot may be pulled more than
+/// one way.
 pub struct Lifted<'a> {
     store: &'a Store,
     tys: &'a [Ty],
@@ -376,6 +376,29 @@ impl<'a> Lifted<'a> {
         self.tys.is_empty()
     }
 
+    /// **The receive primitive.** Pull slot `index` as any type `T` that implements
+    /// [`FromResult`] — `&[u8]`, `Vec<u8>`, or [`Val`]. Mirrors `arg(ArgSource)`: name a
+    /// source *value* to provide, name a sink *type* to receive. A `&[u8]` sink borrows
+    /// `&self`, so a view stays confined to the enclosing scope.
+    pub fn get<'r, T: FromResult<'r>>(&'r self, index: usize) -> T {
+        T::from_result(self, index)
+    }
+
+    /// Sugar for `get::<&[u8]>` — a zero-copy borrowed view (inline slots only).
+    pub fn view(&self, index: usize) -> &[u8] {
+        self.get(index)
+    }
+
+    /// Sugar for `get::<Vec<u8>>` — an owned copy of the slot's bytes.
+    pub fn copy(&self, index: usize) -> Vec<u8> {
+        self.get(index)
+    }
+
+    /// Sugar for `get::<Val>` — a dynamic value (works for any slot).
+    pub fn val(&self, index: usize) -> Val {
+        self.get(index)
+    }
+
     fn list_ptr_count(&self, index: usize) -> (usize, usize) {
         let slot = self.slots[index];
         (
@@ -384,23 +407,14 @@ impl<'a> Lifted<'a> {
         )
     }
 
-    /// **Zero-copy** borrowed view of the flat bytes of `list<inline T>` slot `index`. The
-    /// borrow is tied to `&self`, i.e. to the enclosing scope / handler.
-    pub fn view(&self, index: usize) -> &[u8] {
+    fn lift_view(&self, index: usize) -> &[u8] {
         let ty = &self.tys[index];
         assert!(ty.is_bulk_transferable(), "slot {index} is not an inline type");
         let (ptr, count) = self.list_ptr_count(index);
         lift_flat_view(self.store, ty, ptr, count)
     }
 
-    /// Copy slot `index` out into host-owned bytes.
-    pub fn copy(&self, index: usize) -> Vec<u8> {
-        self.view(index).to_vec()
-    }
-
-    /// Lift slot `index` into a dynamic [`Val`] by walking it element-by-element (the
-    /// general/slow path, and the only one that works for non-inline shapes).
-    pub fn val(&self, index: usize) -> Val {
+    fn lift_val(&self, index: usize) -> Val {
         let ty = &self.tys[index];
         let slot = self.slots[index];
         match ty {
@@ -422,6 +436,36 @@ impl<'a> Lifted<'a> {
             Ty::U32 => Val::U32(self.core[slot].as_i32() as u32),
             other => panic!("lifting {other:?} to a Val is not modelled"),
         }
+    }
+}
+
+/// The **receive** vocabulary: a sink type produced by [`Lifted::get`]. The dual of
+/// [`ArgSource`](crate::call_builder::ArgSource) on the provide side — one enum of source
+/// *values* there, one set of sink *types* here. The split (value vs type parameter) is
+/// forced: every source lowers to the same thing (bytes in guest memory), but the three
+/// receive modes produce genuinely different Rust types.
+pub trait FromResult<'a>: Sized {
+    fn from_result(results: &'a Lifted<'_>, index: usize) -> Self;
+}
+
+/// Zero-copy view — borrows the `Lifted` (hence the enclosing scope).
+impl<'a> FromResult<'a> for &'a [u8] {
+    fn from_result(results: &'a Lifted<'_>, index: usize) -> Self {
+        results.lift_view(index)
+    }
+}
+
+/// Owned copy of the slot's canonical bytes.
+impl<'a> FromResult<'a> for Vec<u8> {
+    fn from_result(results: &'a Lifted<'_>, index: usize) -> Self {
+        results.lift_view(index).to_vec()
+    }
+}
+
+/// Dynamic value, walked element-by-element (the only mode that works for non-inline slots).
+impl<'a> FromResult<'a> for Val {
+    fn from_result(results: &'a Lifted<'_>, index: usize) -> Self {
+        results.lift_val(index)
     }
 }
 
