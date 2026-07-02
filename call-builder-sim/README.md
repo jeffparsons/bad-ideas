@@ -9,6 +9,25 @@ It is **not** wasmtime. The point isn't performance — it's to answer, with rea
 compiler checks, whether the proposed API ergonomics *compose* across the full transfer
 matrix (and whether the *unsafe* usages are compile errors).
 
+## Design goals
+
+A living checklist — the design (and its evolutions) should keep satisfying every item.
+
+1. **Mix representations per argument.** A single call can provide each argument
+   differently — e.g. some as dynamic `Val`s, others from CABI-encoded byte buffers.
+2. **Provide pre-encoded values and lists.** An argument that is a *flat*[^flat]
+   component-model type — or a list of that type — can be provided directly from a byte
+   buffer holding a single value or a contiguous array of values already encoded per the
+   canonical ABI.
+3. **No static type knowledge required.** The host can receive and provide CABI-encoded
+   values without *statically* knowing anything about the specific component-model types
+   involved; everything is driven by reflected type information at run time.
+
+[^flat]: *flat* here means a component-model type with a fixed canonical-ABI layout and no
+    out-of-line storage or ownership — numbers and records/tuples of them, but not strings,
+    nested lists, resources, or handles. (The word is provisional: "flat" already describes
+    ABI *flattening* to core params, so we may prefer *plain*, *POD*, or *fixed-layout*.)
+
 ## The matrix
 
 Each slot is either **lowered** (a value the host *provides* → guest memory) or **lifted**
