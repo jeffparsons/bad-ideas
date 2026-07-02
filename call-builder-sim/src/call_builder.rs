@@ -28,7 +28,8 @@
 use std::rc::Rc;
 
 use crate::fake_wasmtime::{
-    lower_flat, lower_source, Caller, CoreVal, Func, Lifted, OwnedResults, Source, Store, Ty, Val,
+    lower_flat, lower_source, Caller, CoreVal, Func, Lifted, OwnedResults, Producer, Source, Store,
+    Ty, Val,
 };
 
 #[derive(Debug)]
@@ -51,6 +52,10 @@ pub enum ArgSpec {
     FlatIn,
     /// Read-write flat bytes: memcpy in, guest mutates, memcpy back into the same buffer.
     FlatInOut,
+    /// Streamed: fed incrementally, chunk by chunk, pulled during the call ([#12]).
+    ///
+    /// [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+    Stream,
 }
 
 /// The lowering strategy chosen for an argument when the plan is prepared — the "checked"
@@ -69,6 +74,8 @@ pub enum Tier {
     Memcpy,
     /// The type is walked element-by-element.
     ValWalk,
+    /// Pulled incrementally, one bounded `memcpy` per chunk, during the call.
+    Stream,
 }
 
 struct ArgPlan {
@@ -108,6 +115,13 @@ impl PreparedCall {
                     }
                     Tier::Memcpy
                 }
+                ArgSpec::Stream => {
+                    // A stream carries inline elements, checked once here just like a flat arg.
+                    if !ty.is_bulk_transferable() {
+                        return Err(Error::NotInline { index });
+                    }
+                    Tier::Stream
+                }
             };
             plan.push(ArgPlan {
                 ty: ty.clone(),
@@ -145,12 +159,18 @@ impl Func {
     }
 }
 
-/// One argument's data, supplied per call. The flat variants borrow the caller's buffer
-/// for the lifetime of the binding only.
+/// One argument's data, supplied per call. The flat/stream variants borrow the caller's
+/// buffer/producer for the lifetime of the binding only.
 pub enum ArgSource<'a> {
     Val(Val),
     FlatIn(&'a [u8]),
     FlatInOut(&'a mut [u8]),
+    /// A streamed source ([#12]). Borrowed `&'a mut` for the *whole call* — the runtime
+    /// pulls chunks from it during the guest's execution — exactly the same borrow extent
+    /// as a flat arg, so the prepare/bind split is unchanged.
+    ///
+    /// [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+    Stream(&'a mut dyn Producer),
 }
 
 /// The ephemeral, per-call **binding**. Its lifetime `'a` ties it to the argument buffers
@@ -176,6 +196,13 @@ impl<'a> BoundCall<'a> {
 
     pub fn arg_flat_inout(self, bytes: &'a mut [u8]) -> Self {
         self.arg(ArgSource::FlatInOut(bytes))
+    }
+
+    /// Sugar for a streamed argument ([#12]): borrows the producer `&'a mut` for the call.
+    ///
+    /// [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+    pub fn arg_stream(self, producer: &'a mut dyn Producer) -> Self {
+        self.arg(ArgSource::Stream(producer))
     }
 
     /// **Run and own the results.** The easy default: lowers args, runs the guest, copies
@@ -232,6 +259,9 @@ impl<'a> BoundCall<'a> {
         store.reset();
         let mut core: Vec<CoreVal> = Vec::new();
         let mut inout: Vec<(usize, &'a mut [u8])> = Vec::new();
+        // Streamed args aren't materialised up front — the producer is held here and pulled
+        // by the guest during the call. Its core value is a handle (index into `streams`).
+        let mut streams: Vec<&'a mut dyn Producer> = Vec::new();
 
         for (index, (argplan, slot)) in plan.iter().zip(self.slots).enumerate() {
             match (argplan.spec, slot) {
@@ -251,12 +281,19 @@ impl<'a> BoundCall<'a> {
                     core.push(CoreVal::I32(len as i32));
                     inout.push((ptr, bytes));
                 }
+                (ArgSpec::Stream, ArgSource::Stream(producer)) => {
+                    // No up-front lowering: pass a handle, keep the `&'a mut` producer for
+                    // the whole call. This is the borrow-story crux — the producer is held
+                    // for exactly as long as a flat arg (the whole call), no longer.
+                    core.push(CoreVal::I32(streams.len() as i32));
+                    streams.push(producer);
+                }
                 _ => return Err(Error::SpecMismatch { index }),
             }
         }
 
         let core_results = {
-            let mut caller = Caller::new(store, &prepared.func.imports);
+            let mut caller = Caller::new(store, &prepared.func.imports, streams);
             (prepared.func.body)(&mut caller, &core)
         };
         Ok((core_results, inout))

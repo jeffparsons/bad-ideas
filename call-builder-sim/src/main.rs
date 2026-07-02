@@ -12,7 +12,9 @@
 //! The final pipeline threads a single value through all four quadrants at once.
 
 use call_builder_sim::call_builder::{ArgSpec, PreparedCall};
-use call_builder_sim::fake_wasmtime::{Caller, CoreVal, Func, HostImport, Source, Store, Ty, Val};
+use call_builder_sim::fake_wasmtime::{
+    Caller, CoreVal, Func, HostImport, Producer, Source, Store, Ty, Val,
+};
 
 const N: usize = 1_000; // entities
 const STEPS: usize = 100;
@@ -103,7 +105,7 @@ fn demo_params() {
     let func = Func::new(
         vec![Ty::F32, list_of_vec2(), list_of_vec2()],
         vec![],
-        |caller: &mut Caller, core: &[CoreVal]| {
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
             let dt = match core[0] {
                 CoreVal::F32(x) => x,
                 _ => unreachable!("param 0 is dt: f32"),
@@ -164,7 +166,7 @@ fn demo_results() {
     let func = Func::new(
         vec![list_of_vec2()],
         vec![list_of_vec2()],
-        |caller: &mut Caller, core: &[CoreVal]| {
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
             let in_ptr = core[0].as_i32() as usize;
             let count = core[1].as_i32() as usize;
             let store = caller.store();
@@ -247,7 +249,7 @@ fn demo_single_element() {
     let func = Func::new(
         vec![vec2_ty()],
         vec![Ty::List(Box::new(Ty::F32))],
-        |caller: &mut Caller, core: &[CoreVal]| {
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
             let (x, y) = match (core[0], core[1]) {
                 (CoreVal::F32(x), CoreVal::F32(y)) => (x, y),
                 _ => unreachable!("vec2 flattens to two f32 core params"),
@@ -339,7 +341,7 @@ fn demo_mixed_pipeline() {
         vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
         vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
         vec![scale_import],
-        |caller: &mut Caller, core: &[CoreVal]| caller.call_import(0, core),
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| caller.call_import(0, core),
     );
 
     // Native reference.
@@ -383,11 +385,119 @@ fn demo_mixed_pipeline() {
     println!("  [mix] all 4 cells, flat+Val both ways OK  (checksum {pipeline_sum})");
 }
 
+// --- Streaming argument source, mixed with flat + Val (#12) --------------------------
+
+/// Hands a byte buffer out in fixed-size chunks — models an argument delivered incrementally.
+struct ChunkProducer<'d> {
+    data: &'d [u8],
+    chunk_bytes: usize,
+    pos: usize,
+}
+
+impl<'d> ChunkProducer<'d> {
+    fn new(data: &'d [u8], chunk_bytes: usize) -> Self {
+        ChunkProducer {
+            data,
+            chunk_bytes,
+            pos: 0,
+        }
+    }
+}
+
+impl Producer for ChunkProducer<'_> {
+    fn next_chunk(&mut self) -> Option<&[u8]> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let end = (self.pos + self.chunk_bytes).min(self.data.len());
+        let chunk = &self.data[self.pos..end];
+        self.pos = end;
+        Some(chunk)
+    }
+}
+
+fn demo_stream() {
+    // Guest: accumulate(scale: f32 [Val], seed: list<vec2> [Flat], events: stream<vec2> [Stream])
+    //        -> list<f32> ;  total = Σ seed components + scale · Σ event components.
+    let func = Func::new(
+        vec![Ty::F32, list_of_vec2(), list_of_vec2()],
+        vec![Ty::List(Box::new(Ty::F32))],
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
+            let scale = match core[0] {
+                CoreVal::F32(x) => x,
+                _ => unreachable!("param 0 is scale: f32"),
+            };
+            let seed_ptr = core[1].as_i32() as usize;
+            let seed_count = core[2].as_i32() as usize;
+            let stream = core[3].as_i32() as usize;
+
+            let mut total = 0.0f32;
+            {
+                let s = caller.store();
+                for i in 0..seed_count {
+                    total += s.read_f32(seed_ptr + i * 8) + s.read_f32(seed_ptr + i * 8 + 4);
+                }
+            }
+            // Pull the streamed events incrementally — one bounded memcpy per chunk.
+            while let Some((ptr, byte_len)) = caller.pull(stream) {
+                let s = caller.store();
+                let mut off = ptr;
+                while off + 8 <= ptr + byte_len {
+                    total += (s.read_f32(off) + s.read_f32(off + 4)) * scale;
+                    off += 8;
+                }
+            }
+
+            let s = caller.store();
+            let out = s.realloc(4, 4);
+            s.write_f32(out, total);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
+        },
+    );
+
+    let seed = initial(0x5eed_1234);
+    let events = initial(0xe0e0_e0e0);
+    let scale = 0.5f32;
+
+    // Native reference (same operation order as the guest).
+    let mut native_total = 0.0f32;
+    for i in 0..N {
+        native_total += read_f32(&seed, i * 8) + read_f32(&seed, i * 8 + 4);
+    }
+    for i in 0..N {
+        native_total += (read_f32(&events, i * 8) + read_f32(&events, i * 8 + 4)) * scale;
+    }
+
+    let prepared =
+        PreparedCall::new(&func, &[ArgSpec::Val, ArgSpec::FlatIn, ArgSpec::Stream]).unwrap();
+    let mut store = Store::new(N * 8 * 3 + 8192);
+
+    // The producer feeds `events` in 64-vec2 chunks, pulled during the call. It is borrowed
+    // `&mut` only for the invocation; afterwards it (and `seed`) are free again.
+    let mut producer = ChunkProducer::new(&events, 64 * 8);
+    let sim_total = prepared
+        .bind()
+        .arg_val(Val::F32(scale)) // Val
+        .arg_flat_in(&seed) // flat
+        .arg_stream(&mut producer) // stream — pulled chunk by chunk during the call
+        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
+        .unwrap();
+
+    print!("  arg tiers: ");
+    for (i, tier) in prepared.tiers().iter().enumerate() {
+        print!("arg{i}={tier:?} ");
+    }
+    println!();
+    assert_eq!(native_total, sim_total, "stream + flat + Val mix must match native");
+    println!("  [stream] Val + flat + stream mixed OK  (total {sim_total:.3})");
+}
+
 fn main() {
     println!("call-builder-sim: canonical-ABI transfer matrix ({N} entities)");
     demo_params();
     demo_results();
     demo_single_element();
     demo_mixed_pipeline();
+    demo_stream();
     println!("  OK: every cell matches its native reference, for both bulk and Val.");
 }

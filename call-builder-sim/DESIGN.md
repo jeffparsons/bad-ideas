@@ -567,6 +567,17 @@ calls) is a different lifetime — a separate long-lived binding, closer to how 
 readers already work — and should *not* be shoehorned into the per-call builder. The API can
 host both; `ArgSource::Stream` is the within-call one.
 
+**Implemented, and what compiling it pinned down.** The sim now ships this
+(`fake_wasmtime::Producer`, `ArgSource::Stream`, `Caller::pull`, a mixed `Val + flat + stream`
+demo matching a native reference, and a `compile_fail` proving the producer can't be touched
+while the binding holds it). Writing real code surfaced one thing prose glossed over: the
+runtime context (`Caller`) needs **two** lifetimes — one for the store/imports borrow, one for
+the producer — because `&'p mut dyn Producer` is *invariant* in `'p` and cannot be unified
+with the shorter store borrow. That's not a wart; it's the borrow story made concrete — a
+streamed arg's borrow is a genuinely distinct thing the runtime holds across the whole call,
+exactly as the design claimed. The per-call builder and the `compile_fail` are unchanged in
+spirit from the flat case.
+
 ### 9.2 Typed buffers: a guest → host → guest conduit ([#15])
 
 **Use case (your framing).** Collect many results from one component instance into a host
@@ -638,9 +649,10 @@ for `vec2` can never be silently fed to a call expecting something else — it e
   a `Buffer` arg source and an `append_to` result sink — the same "one vocabulary, reused"
   story as the four cells.
 
-Neither is implemented in the sim yet; each would make a good compiles-and-runs follow-up —
-the streaming one to *pin down the borrow story concretely*, the typed-buffer one to exercise
-the collect → slice → feed round trip across two instances.
+**#12 is now implemented in the sim** (§9.1), which pinned the borrow story down concretely
+and even surfaced a detail prose missed (the two-lifetime `Caller`). **#15 is still a
+rough-out** — a good next compiles-and-runs follow-up to exercise the collect → slice → feed
+round trip across two instances.
 
 [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
 [#15]: https://github.com/jeffparsons/bad-ideas/issues/15

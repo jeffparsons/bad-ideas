@@ -181,6 +181,7 @@ across a buffer mutation, one for letting a scoped result view escape its closur
 | `fake_wasmtime::Func` (`params`/`results`/`imports` + closure `body`) | a `component::Func` + the compiled guest |
 | `fake_wasmtime::HostImport` / `ImportCall` | a `Linker` import + its `Caller`-scoped invocation |
 | `Source` (`Flat`/`Val`) provide · `Lifted::get::<T>` receive (`view`/`copy`/`val` sugar) | the two reused vocabularies, in all four cells |
+| `Producer` / `ArgSource::Stream` / `Caller::pull` | a `stream<T>` argument, pulled in chunks during the call (#12) |
 | `Val` / `lower_val` (walk element-by-element) | `component::Val` / today's `Func::call(&[Val])` |
 | `lower_flat` / `lift_flat_view` (one memcpy) | the bulk fast paths #13788 asks for |
 | `ArgSpec` / `Tier` | the export-side "checked-with-a-fast-path" decision, made once |
@@ -192,17 +193,19 @@ For a concrete proposal of these as real wasmtime types — `Func::prepare_call`
 ## Run it
 
 ```sh
-cargo run     # all four quadrants; each matches a native reference
-cargo test    # doctests, incl. the two compile_fail borrow-safety proofs
+cargo run     # all four quadrants + the streaming demo; each matches a native reference
+cargo test    # doctests, incl. the three compile_fail borrow-safety proofs
 ```
 
 ## Scope
 
 The whole matrix, with `Flat` + `Val` mixable on both the provide and receive sides in
 both directions, single pre-lowered values as well as `list<inline T>`, in/inout export
-args, owning + scoped + `val` result reading, and a guest↔host import round trip — plus the
-reuse/borrow proofs. Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy
-(`value.lower`) lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a
-tier-2 validation sweep for `bool`/`enum`. These are noted where they would slot in.
+args, owning + scoped + `val` result reading, a guest↔host import round trip, and a
+**streaming argument source** ([#12] — `Producer` / `ArgSource::Stream` / `Caller::pull`,
+pulled chunk by chunk) — plus the reuse/borrow proofs. Deliberately *modelled but not
+implemented* (see `DESIGN.md` §9.2 and the notes elsewhere): typed buffers ([#15]), a lazy
+(`value.lower`) lowering tier, async `invoke`, and a tier-2 validation sweep for `bool`/`enum`.
 
 [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+[#15]: https://github.com/jeffparsons/bad-ideas/issues/15

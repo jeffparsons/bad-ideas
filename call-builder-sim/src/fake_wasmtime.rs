@@ -227,7 +227,7 @@ impl HostImport {
 /// results.
 /// The compiled-guest stand-in: given a [`Caller`] and flattened core params, produce
 /// flattened core results.
-pub type GuestBody = dyn Fn(&mut Caller, &[CoreVal]) -> Vec<CoreVal>;
+pub type GuestBody = dyn Fn(&mut Caller<'_, '_>, &[CoreVal]) -> Vec<CoreVal>;
 
 pub struct Func {
     pub params: Vec<Ty>,
@@ -240,7 +240,7 @@ impl Func {
     pub fn new(
         params: Vec<Ty>,
         results: Vec<Ty>,
-        body: impl Fn(&mut Caller, &[CoreVal]) -> Vec<CoreVal> + 'static,
+        body: impl Fn(&mut Caller<'_, '_>, &[CoreVal]) -> Vec<CoreVal> + 'static,
     ) -> Rc<Func> {
         Func::with_imports(params, results, Vec::new(), body)
     }
@@ -249,7 +249,7 @@ impl Func {
         params: Vec<Ty>,
         results: Vec<Ty>,
         imports: Vec<HostImport>,
-        body: impl Fn(&mut Caller, &[CoreVal]) -> Vec<CoreVal> + 'static,
+        body: impl Fn(&mut Caller<'_, '_>, &[CoreVal]) -> Vec<CoreVal> + 'static,
     ) -> Rc<Func> {
         Rc::new(Func {
             params,
@@ -260,21 +260,62 @@ impl Func {
     }
 }
 
-/// The execution context handed to a guest body: `&mut Store` (linear memory) plus the
-/// imports it may call. Stands in for `wasmtime::StoreContextMut` / `Caller`.
-pub struct Caller<'a> {
-    store: &'a mut Store,
-    imports: &'a [HostImport],
+/// A **streaming argument source** ([#12]): a value fed *incrementally* rather than as one
+/// materialised buffer. The runtime calls [`next_chunk`](Producer::next_chunk) repeatedly
+/// *during the guest call*, copying each chunk of pre-encoded inline elements into guest
+/// memory on demand — the pull-based, lazy-lowering-native counterpart to a flat `memcpy`.
+///
+/// [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
+pub trait Producer {
+    /// The next chunk of pre-encoded inline elements, or `None` at end of stream.
+    fn next_chunk(&mut self) -> Option<&[u8]>;
 }
 
-impl<'a> Caller<'a> {
-    pub(crate) fn new(store: &'a mut Store, imports: &'a [HostImport]) -> Self {
-        Caller { store, imports }
+/// The execution context handed to a guest body: `&mut Store` (linear memory), the imports
+/// it may call, plus any streamed args it can pull. Stands in for
+/// `wasmtime::StoreContextMut` / `Caller`.
+// Two lifetimes on purpose: the store/imports borrow (`'s`) for the call, and the streamed
+// producers (`'p`) borrowed from the `BoundCall`. They differ, and `&'p mut dyn Producer` is
+// invariant in `'p`, so they can't be collapsed into one — which is itself part of #12's
+// answer: a stream's borrow is a genuinely distinct thing the runtime holds across the call.
+pub struct Caller<'p, 's> {
+    store: &'s mut Store,
+    imports: &'s [HostImport],
+    streams: Vec<&'p mut dyn Producer>,
+}
+
+impl<'p, 's> Caller<'p, 's> {
+    pub(crate) fn new(
+        store: &'s mut Store,
+        imports: &'s [HostImport],
+        streams: Vec<&'p mut dyn Producer>,
+    ) -> Self {
+        Caller {
+            store,
+            imports,
+            streams,
+        }
     }
 
     /// Direct access to linear memory (the guest body reads/writes its params here).
     pub fn store(&mut self) -> &mut Store {
         self.store
+    }
+
+    /// **Pull the next chunk of a streamed argument.** Advances stream `handle`, copies the
+    /// next chunk of pre-encoded elements into guest memory, and returns `(ptr, byte_len)`
+    /// of the freshly written region — or `None` at end of stream. Each pull is a bounded
+    /// `memcpy`; the producer stays borrowed by the [`BoundCall`](crate::call_builder::BoundCall)
+    /// for the whole call, which is exactly the point (see #12).
+    pub fn pull(&mut self, handle: usize) -> Option<(usize, usize)> {
+        // Copy the chunk out first so the producer borrow ends before we touch the store.
+        let chunk = {
+            let producer: &mut dyn Producer = &mut *self.streams[handle];
+            producer.next_chunk()?.to_vec()
+        };
+        let ptr = self.store.realloc(chunk.len(), 4);
+        self.store.write(ptr, &chunk);
+        Some((ptr, chunk.len()))
     }
 
     /// The guest calls a host import. This drives quadrants 3 (guest->host **params**,
@@ -287,7 +328,7 @@ impl<'a> Caller<'a> {
     pub fn call_import(&mut self, index: usize, core_args: &[CoreVal]) -> Vec<CoreVal> {
         // Copy the slice reference out so `import` doesn't keep `self` borrowed while we
         // reborrow `self.store` mutably below (references are `Copy`).
-        let imports: &'a [HostImport] = self.imports;
+        let imports: &'s [HostImport] = self.imports;
         let import = &imports[index];
         let mut ic = ImportCall {
             store: self.store,

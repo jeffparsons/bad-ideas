@@ -88,6 +88,34 @@
 //! let escaped = prepared.bind().invoke_scoped(&mut store, |r| r.view(0)).unwrap();
 //! let _ = escaped;
 //! ```
+//!
+//! # A streamed argument is borrowed for the whole call
+//!
+//! A streaming source ([#12]) borrows its producer `&mut` for the entire invocation — just
+//! like a flat arg — so touching the producer while the binding is alive does not compile:
+//!
+//! ```compile_fail
+//! use call_builder_sim::call_builder::{ArgSpec, PreparedCall};
+//! use call_builder_sim::fake_wasmtime::{Func, Producer, Store, Ty};
+//!
+//! struct P;
+//! impl Producer for P { fn next_chunk(&mut self) -> Option<&[u8]> { None } }
+//!
+//! let func = Func::new(vec![Ty::List(Box::new(Ty::F32))], vec![], |caller, core| {
+//!     let h = core[0].as_i32() as usize;
+//!     while caller.pull(h).is_some() {}
+//!     vec![]
+//! });
+//! let prepared = PreparedCall::new(&func, &[ArgSpec::Stream]).unwrap();
+//! let mut store = Store::new(1024);
+//!
+//! let mut producer = P;
+//! let bound = prepared.bind().arg_stream(&mut producer);
+//! producer.next_chunk();              // ERROR: `producer` already mutably borrowed by `bound`
+//! bound.invoke(&mut store).unwrap();
+//! ```
+//!
+//! [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
 
 pub mod call_builder;
 pub mod fake_wasmtime;
