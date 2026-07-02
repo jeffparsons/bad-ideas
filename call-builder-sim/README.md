@@ -9,21 +9,39 @@ It is **not** wasmtime. The point isn't performance — it's to answer, with rea
 compiler checks, whether the proposed API ergonomics *compose* across the full transfer
 matrix (and whether the *unsafe* usages are compile errors).
 
-## The 2×2 matrix
+## The matrix
 
-Every transfer is a **bulk lower** (host bytes → guest memory) or a **bulk lift** (guest
-memory → host bytes/view) of a `list<flat T>` — where `T` is accepted only if Wasmtime can
-prove from reflected type info that it is a fixed-layout POD with no strings, nested lists,
-resources, or handles. Which primitive a slot uses depends on who owns the memory, *not* on
-the direction of the call:
+Each slot is either **lowered** (a value the host *provides* → guest memory) or **lifted**
+(a value the host *receives* ← guest memory). Which one it is depends on who owns the
+memory, *not* on the direction of the call:
 
 | | params (in) | results (out) |
 | --- | --- | --- |
-| **host → guest** (export call) | bulk **lower** — `PreparedCall` / `BoundCall` | bulk **lift** — `invoke_scoped` / `invoke_collect` |
-| **guest → host** (import call) | bulk **lift** — `ImportCall::arg_list_view` | bulk **lower** — `ImportCall::return_flat_list` |
+| **host → guest** (export call) | host **provides** → *lower* | host **receives** → *lift* |
+| **guest → host** (import call) | host **receives** → *lift* | host **provides** → *lower* |
 
-`src/main.rs` exercises all four quadrants against a native reference; the final pipeline
-threads one value through every quadrant in a single call.
+Crucially, each slot **independently picks its representation** — nothing forces a call to
+be all-flat or all-dynamic; one call mixes them freely, in both directions:
+
+- **provide** (lower) from a `Source`: `Flat(&[u8])` — a pre-encoded CABI image copied as
+  one `memcpy`, covering a whole `list<flat T>` **or a single value/record** — or `Val`,
+  walked element-by-element. (A future `Lazy` slots in here without changing anything else.)
+- **receive** (lift) from a `Lifted` accessor, choosing *at the pull site*: `view`
+  (zero-copy borrow), `copy` (owned bytes), or `val` (dynamic).
+
+The flat fast path is offered only where the type is provably flat (fixed CABI layout, no
+strings, nested lists, resources, or handles); everything else falls back to `Val`. So
+"bulk" is one *representation*, not the definition of a transfer.
+
+The two vocabularies are reused across all four cells:
+
+| | provide (lower) | receive (lift) |
+| --- | --- | --- |
+| **host → guest** (export) | `BoundCall::arg_flat_in` / `arg_val` / `arg_flat_inout` | `invoke_scoped(\|r\| …)` / `invoke_collect` |
+| **guest → host** (import) | `ImportCall::set(i, Source)` | `ImportCall::args()` → `Lifted` |
+
+`src/main.rs` exercises every cell against a native reference; the final pipeline mixes
+flat and `Val` on *both* the lower and lift sides, in *both* directions, in a single call.
 
 The full reasoning — the cost table, naming options, and how this survives **lazy value
 lowering** and **async** unchanged — is in [`DESIGN.md`](./DESIGN.md).
@@ -51,9 +69,10 @@ across a buffer mutation, one for letting a scoped result view escape its closur
 | `fake_wasmtime::Store` (`mem` + bump `realloc`) | a `Store` + the instance's linear memory + `cabi_realloc` |
 | `fake_wasmtime::Func` (`params`/`results`/`imports` + closure `body`) | a `component::Func` + the compiled guest |
 | `fake_wasmtime::HostImport` / `ImportCall` | a `Linker` import + its `Caller`-scoped invocation |
+| `Source` (`Flat`/`Val`) / `Lifted` (`view`/`copy`/`val`) | the provide / receive vocabularies, reused in all four cells |
 | `Val` / `lower_val` (walk element-by-element) | `component::Val` / today's `Func::call(&[Val])` |
-| `lower_flat` (one memcpy) / `lift_flat[_view]` | the bulk fast paths #13788 asks for |
-| `ArgSpec` / `Tier` | the "checked-with-a-fast-path" decision, made once |
+| `lower_flat` / `lift_flat_view` (one memcpy) | the bulk fast paths #13788 asks for |
+| `ArgSpec` / `Tier` | the export-side "checked-with-a-fast-path" decision, made once |
 
 ## Run it
 
@@ -64,10 +83,11 @@ cargo test    # doctests, incl. the two compile_fail borrow-safety proofs
 
 ## Scope
 
-An initial pass at the whole matrix: `Val` + flat in/inout arg sources, scoped + eager
-result reading, and a guest↔host import round trip — plus the reuse/borrow proofs.
-Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy (`value.lower`)
-lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a tier-2
-validation sweep for `bool`/`enum`. These are noted where they would slot in.
+The whole matrix, with `Flat` + `Val` mixable on both the provide and receive sides in
+both directions, single pre-lowered values as well as `list<flat T>`, in/inout export
+args, scoped + eager + `val` result reading, and a guest↔host import round trip — plus the
+reuse/borrow proofs. Deliberately *modelled but not implemented* (see `DESIGN.md`): a lazy
+(`value.lower`) lowering tier, async `invoke`, a streaming arg/result source ([#12]), and a
+tier-2 validation sweep for `bool`/`enum`. These are noted where they would slot in.
 
 [#12]: https://github.com/jeffparsons/bad-ideas/issues/12

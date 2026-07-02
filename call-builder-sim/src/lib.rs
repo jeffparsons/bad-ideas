@@ -6,8 +6,15 @@
 //!
 //! | | params (in) | results (out) |
 //! | --- | --- | --- |
-//! | **host → guest** (export) | [`call_builder`]: `PreparedCall` / `BoundCall` — bulk **lower** | [`call_builder`]: `invoke_scoped` / `invoke_collect` — bulk **lift** |
-//! | **guest → host** (import) | [`fake_wasmtime::ImportCall::arg_list_view`] — bulk **lift** | [`fake_wasmtime::ImportCall::return_flat_list`] — bulk **lower** |
+//! | **host → guest** (export) | *provide* via `PreparedCall`/`BoundCall` — lower | *receive* via `invoke_scoped`/`invoke_collect` — lift |
+//! | **guest → host** (import) | *receive* via [`fake_wasmtime::ImportCall::args`] — lift | *provide* via [`fake_wasmtime::ImportCall::set`] — lower |
+//!
+//! Two dual vocabularies are reused across all four cells: a
+//! [`Source`](fake_wasmtime::Source) (`Flat` | `Val`) to *provide* a value, and a
+//! [`Lifted`](fake_wasmtime::Lifted) accessor (`view` | `copy` | `val`) to *receive* one.
+//! Each slot picks its own representation, so one call freely mixes flat and dynamic in
+//! both directions. `Source::Flat` also covers a single pre-lowered value, not just
+//! `list<flat T>`.
 //!
 //! It is not wasmtime; [`fake_wasmtime`] is a tiny stand-in that reproduces the same
 //! borrow structure a real embedding has, so this crate can *prove* — by compiling and
@@ -77,7 +84,7 @@
 //! let mut store = Store::new(1024);
 //!
 //! // ERROR: the view borrows the scope; it cannot be returned out of the closure.
-//! let escaped = prepared.bind().invoke_scoped(&mut store, |r| r.flat_list_view(0)).unwrap();
+//! let escaped = prepared.bind().invoke_scoped(&mut store, |r| r.view(0)).unwrap();
 //! let _ = escaped;
 //! ```
 

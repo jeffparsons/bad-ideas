@@ -19,18 +19,15 @@
 //! ## Receiving results
 //!
 //! Guest-owned result memory is only valid between "the guest returned" and "canonical
-//! post-return cleanup". So results are offered two ways, and the caller picks per call:
-//!
-//! * [`BoundCall::invoke_scoped`] — a Wasmtime-controlled scope yields borrowed,
-//!   zero-copy [`Results`] views that cannot escape (the ergonomic + fast path);
-//! * [`BoundCall::invoke_collect`] — eagerly copies each result list out into host-owned
-//!   `Vec<u8>` for callers who want to keep the bytes.
+//! post-return cleanup". So [`BoundCall::invoke_scoped`] hands a scoped [`Lifted`]
+//! accessor into a closure — the same "receive" vocabulary used on the import side — and
+//! the caller picks `view`/`copy`/`val` per result. [`BoundCall::invoke_collect`] is a
+//! convenience that copies every result out into host-owned `Vec<u8>`.
 
 use std::rc::Rc;
 
 use crate::fake_wasmtime::{
-    core_slot_offsets, lift_flat, lift_flat_view, lower_flat, lower_val, Caller, CoreVal, Func,
-    Store, Ty, Val,
+    lower_flat, lower_source, Caller, CoreVal, Func, Lifted, Source, Store, Ty, Val,
 };
 
 #[derive(Debug)]
@@ -188,46 +185,36 @@ impl<'a> BoundCall<'a> {
         Ok(())
     }
 
-    /// **Quadrant 2 (host -> guest results, bulk lift), scoped.** Lower args, run the
-    /// guest, then hand a borrowed [`Results`] view into `f`. The views are valid only
-    /// for the duration of `f` — they cannot escape it, and cleanup / inout copy-back
-    /// happens after `f` returns. This is the zero-copy fast path for reading results.
+    /// **Host → guest results (lift), scoped.** Lower args, run the guest, then hand a
+    /// borrowed [`Lifted`] accessor into `f`. Inside `f` the caller picks `view`/`copy`/
+    /// `val` per result; the borrows are valid only for the duration of `f` — they cannot
+    /// escape it, and cleanup / inout copy-back happens after `f` returns.
     pub fn invoke_scoped<R>(
         self,
         store: &mut Store,
-        f: impl FnOnce(&Results) -> R,
+        f: impl FnOnce(&Lifted) -> R,
     ) -> Result<R, Error> {
         // Result type shapes are needed to interpret the core results; grab them before
         // `self` is torn apart by `lower_and_run`.
         let result_tys = self.prepared.func.results.clone();
         let (core_results, inout) = self.lower_and_run(store)?;
         let out = {
-            let results = Results {
-                store,
-                result_tys: &result_tys,
-                slots: core_slot_offsets(&result_tys),
-                core: core_results,
-            };
+            let results = Lifted::new(&*store, &result_tys, &core_results);
             f(&results)
         }; // `results` (and its borrowed views) dropped here, before copy-back.
         copy_back(store, inout);
         Ok(out)
     }
 
-    /// **Quadrant 2, eager.** Lower args, run the guest, then copy every `list<flat T>`
-    /// result out into a host-owned `Vec<u8>`. For callers who want to keep the bytes
-    /// past the call.
+    /// **Host → guest results (lift), eager.** Lower args, run the guest, then copy every
+    /// `list<flat T>` result out into a host-owned `Vec<u8>`. For callers who want to keep
+    /// the bytes past the call.
     pub fn invoke_collect(self, store: &mut Store) -> Result<Vec<Vec<u8>>, Error> {
         let result_tys = self.prepared.func.results.clone();
         let (core_results, inout) = self.lower_and_run(store)?;
-        let slots = core_slot_offsets(&result_tys);
-        let mut out = Vec::with_capacity(result_tys.len());
-        for (i, ty) in result_tys.iter().enumerate() {
-            let slot = slots[i];
-            let ptr = core_results[slot].as_i32() as usize;
-            let count = core_results[slot + 1].as_i32() as usize;
-            out.push(lift_flat(store, ty, ptr, count));
-        }
+        let results = Lifted::new(&*store, &result_tys, &core_results);
+        let out = (0..results.len()).map(|i| results.copy(i)).collect();
+        drop(results);
         copy_back(store, inout);
         Ok(out)
     }
@@ -250,13 +237,14 @@ impl<'a> BoundCall<'a> {
 
         for (index, (argplan, slot)) in plan.iter().zip(self.slots).enumerate() {
             match (argplan.spec, slot) {
+                // Both non-inout sources go through the one lowering choke point, so a
+                // single flat value flattens by-value exactly like it would on the import
+                // result side.
                 (ArgSpec::Val, ArgSource::Val(v)) => {
-                    lower_val(store, &argplan.ty, &v, &mut core);
+                    core.extend(lower_source(store, &argplan.ty, Source::Val(v)));
                 }
                 (ArgSpec::FlatIn, ArgSource::FlatIn(bytes)) => {
-                    let (ptr, len) = lower_flat(store, &argplan.ty, bytes);
-                    core.push(CoreVal::I32(ptr as i32));
-                    core.push(CoreVal::I32(len as i32));
+                    core.extend(lower_source(store, &argplan.ty, Source::Flat(bytes)));
                 }
                 (ArgSpec::FlatInOut, ArgSource::FlatInOut(bytes)) => {
                     // Reborrow as shared for the copy-in, then keep the `&mut` for copy-back.
@@ -285,37 +273,5 @@ fn copy_back(store: &Store, inout: Vec<(usize, &mut [u8])>) {
     }
 }
 
-/// Guest-owned result memory, exposed for the extent of an [`BoundCall::invoke_scoped`]
-/// closure. Views borrow `&Store`, so they cannot outlive the scope.
-pub struct Results<'a> {
-    store: &'a Store,
-    result_tys: &'a [Ty],
-    slots: Vec<usize>,
-    core: Vec<CoreVal>,
-}
-
-impl Results<'_> {
-    /// Number of results.
-    pub fn len(&self) -> usize {
-        self.result_tys.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.result_tys.is_empty()
-    }
-
-    /// **Zero-copy** borrowed view of the flat bytes of `list<flat T>` result `index`.
-    /// The borrow is tied to `&self`, i.e. to the enclosing `invoke_scoped` closure.
-    pub fn flat_list_view(&self, index: usize) -> &[u8] {
-        let ty = &self.result_tys[index];
-        let slot = self.slots[index];
-        let ptr = self.core[slot].as_i32() as usize;
-        let count = self.core[slot + 1].as_i32() as usize;
-        lift_flat_view(self.store, ty, ptr, count)
-    }
-
-    /// Copy result `index` out into host-owned bytes (available inside the scope too).
-    pub fn copy_out(&self, index: usize) -> Vec<u8> {
-        self.flat_list_view(index).to_vec()
-    }
-}
+// The "receive" accessor lives in `fake_wasmtime` as `Lifted`, shared with the import
+// side so host→guest results and guest→host params speak the same vocabulary.

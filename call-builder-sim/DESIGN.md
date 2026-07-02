@@ -9,31 +9,53 @@ The companion crate compiles and runs all four quadrants; this doc is the reason
 
 ---
 
-## 1. The reframe: one primitive, four quadrants
+## 1. The reframe: two operations, four surfaces
 
-The call builder is one ergonomic surface over a more general operation. The underlying
-primitive is a **checked bulk transfer of `list<flat T>`**, in two directions:
-
-- **bulk lower** — host-owned `&[u8]` → canonical-ABI image in guest memory
-- **bulk lift** — canonical-ABI image in guest memory → host `&[u8]` / borrowed view
-
-`T` qualifies only if Wasmtime can prove, from reflected component type info, that it has
-a **fixed canonical-ABI layout with no transitive strings, lists, resources, handles, or
-other pointer/ownership-bearing values.** (In the sim, `Ty::is_flat` is that gate;
-`Ty::String`/`Ty::Handle` exist purely to be rejected by it.)
-
-Which primitive a slot uses is determined by **who owns the memory and who reads it**, and
-that is *orthogonal to the direction of the call*:
+The call builder is one ergonomic surface over a more general operation. The two
+underlying operations are just **lower** (a value the host *provides* → guest memory) and
+**lift** (a value the host *receives* ← guest memory). Which one a slot uses is determined
+by **who owns the memory**, and that is *orthogonal to the direction of the call*:
 
 | | params (in) | results (out) |
 | --- | --- | --- |
-| **host → guest** (export call) | bulk **lower** — host bytes into guest mem | bulk **lift** — guest mem into host view |
-| **guest → host** (import call) | bulk **lift** — guest mem into host view | bulk **lower** — host bytes into guest mem |
+| **host → guest** (export call) | host **provides** → *lower* | host **receives** → *lift* |
+| **guest → host** (import call) | host **receives** → *lift* | host **provides** → *lower* |
 
-Note the diagonal symmetry: the two "host provides the bytes" cells are both *lower*; the
-two "host receives the bytes" cells are both *lift*. So there are really only two
-operations, exposed on four surfaces. The call builder is the surface for the top-left
-cell; the other three want sibling surfaces, not the same builder.
+The diagonal symmetry: the two "host provides" cells are both *lower*; the two "host
+receives" cells are both *lift*. Two operations, four surfaces.
+
+### Representation is a separate, per-slot choice — mix freely
+
+"Bulk" is **not** the definition of a transfer; it is one *representation* a slot can use.
+Each slot independently picks how it is lowered or lifted, so a single call mixes flat and
+dynamic in both directions (the `demo_mixed_pipeline` does exactly this). Two dual
+vocabularies capture the choice:
+
+- **provide** (lower) a value from a **`Source`**:
+  - `Flat(&[u8])` — the caller already holds the canonical (CABI-encoded) bytes; copied in
+    as one `memcpy`. This covers a whole `list<flat T>` **and a single pre-lowered
+    value/record** — arity comes from the slot type, so it is not list-only.
+  - `Val` — a dynamic value walked element-by-element (general/slow).
+  - *(future)* `Lazy` — defer the copy to a pull *during* the call (§5); slots in here.
+- **receive** (lift) a value from a **`Lifted`** accessor, choosing *at the pull site*:
+  `view` (zero-copy borrow), `copy` (owned bytes), or `val` (dynamic).
+
+Note the deliberate asymmetry between the two vocabularies: providing is an **enum bound up
+front** (you must commit to how you supply the bytes), while receiving is an **accessor with
+methods** (you decide how to take the value at the moment you take it — and may take the
+same slot more than one way). That mirrors reality: you can't lower what you haven't
+described, but you can lift an already-materialised value however you like.
+
+The **flat** path is offered only where the type is provably flat: a fixed CABI layout with
+no transitive strings, lists, resources, handles, or other pointer/ownership-bearing values.
+(In the sim, `Ty::is_flat` is that gate; `Ty::String`/`Ty::Handle` exist purely to be
+rejected by it.) Anything else falls back to `Val`, per slot — which is why "combine bulk
+AND dynamic" is the default, not a special case.
+
+So the four cells reduce to **one `Source`/`Lifted` pair reused everywhere**; the call
+direction only decides which slots are provided and which are received. The call builder is
+the export-side surface; `ImportCall` is its import-side mirror, speaking the same two
+vocabularies.
 
 ---
 
@@ -85,7 +107,8 @@ most widely understood prepare-then-execute vocabulary and match the "bind" #13 
 | export bound (per-call) | `BoundCall<'a>` | `CallBinding`, `Invocation` |
 | shape → bound verb | `.bind()` | `.with()`, `.begin()` |
 | run verb | `.invoke()` | `.execute()`, `.call()` |
-| result view holder | `Results<'scope>` | `ResultView`, `Lifted` |
+| provide vocabulary (lower) | `Source` (`Flat` \| `Val`) | `Arg`, `Lowerable` |
+| receive vocabulary (lift) — shared by results **and** import args | `Lifted<'a>` (`view`/`copy`/`val`) | `Results`, `ResultView`, `Received` |
 | import shape (registered) | `PreparedImport` *(sim: `HostImport`)* | `ImportShape`, `HostFn` |
 | import active handle | `ImportCall<'s>` | `ImportInvocation`, `Incoming` |
 
@@ -97,14 +120,15 @@ the most clarity for the least novelty), and treat `CallShape` as the fallback i
 "prepared" keeps reading as ambiguous. The sim uses `HostImport` for the import shape as a
 placeholder; `PreparedImport` would restore the symmetry if we want it.
 
-Whatever the nouns, the honest primitive underneath should be named on both sides as
-**bulk lower** / **bulk lift**, so the docs can point at one concept for all four cells.
+Whatever the nouns, the honest operations underneath should be named on both sides as
+**lower** / **lift** (with "bulk" as the *flat representation* of each), so the docs can
+point at one `Source`/`Lifted` pair for all four cells.
 
 ---
 
 ## 4. The four surfaces, with directions and recommendations
 
-### Q1 — host → guest params (bulk lower) — `PreparedCall` / `BoundCall`
+### Q1 — host → guest params (lower) — `PreparedCall` / `BoundCall`
 
 The original prototype. Each arg picks its representation (`Val`, `flat_in`, `flat_inout`),
 validated once; the bound call borrows the buffers for exactly one `invoke`, which consumes
@@ -114,7 +138,13 @@ positional array (`.bind(&[Src::FlatIn(a), Src::Val(v)])`). Recommendation: keep
 builder — it reads well and lets each `arg_*` method carry its own borrow, which is what
 makes the per-arg lifetimes fall out correctly.
 
-### Q2 — host → guest results (bulk lift)
+Since the merge of the `Source`/`Lifted` vocabularies (§1), Q1's provide side is literally
+the same `Source` enum the import result side uses, and its `flat_in`/`val` sources go
+through one `lower_source` choke point — so a single pre-lowered value/record flattens
+by-value identically on both sides. `flat_inout` stays export-only, because "guest mutates a
+host buffer in place" only makes sense for a param the host owns across the call.
+
+### Q2 — host → guest results (lift)
 
 Guest result memory is valid only between "guest returned" and "post-return cleanup", so a
 freely-returned borrowed result is unsound. Three directions:
@@ -135,33 +165,46 @@ freely-returned borrowed result is unsound. Three directions:
    - *Cons:* always copies, even when the host only wanted to fold a checksum.
 
 **Recommendation:** make **(1) the primitive** and layer **(3) on top** for convenience
-(the sim ships both). Avoid **(2)** as the foundation — it is the one shape that fights both
-reuse and async. A caller who genuinely wants a stored handle can `invoke_collect`.
+(the sim ships both, via the `Lifted` accessor: `invoke_scoped` yields it, `invoke_collect`
+folds `.copy()` over it). Avoid **(2)** as the foundation — it is the one shape that fights
+both reuse and async. Because the receive vocabulary is an accessor, `view`/`copy`/`val` are
+all available per result at the pull site; no separate result-spec is needed.
 
-### Q3 — guest → host params (bulk lift) — `ImportCall::arg_list_view`
+### Q3 — guest → host params (lift) — `ImportCall::args() -> Lifted`
 
-Inside a host import handler, the guest's args are already lifetime-bounded by the callback.
-This is the *most defensible* place to expose borrowed guest memory. Direction: borrowed
-view (`arg_list_view(i) -> &[u8]`, zero copy, bounded by `&self`) vs eager copy
-(`arg_list_copied(i) -> Vec<u8>`). Recommendation: **view as primitive, copy as sugar** —
-same split as Q2. The sim's `arg_list_view` borrows `&self`, so it cannot be retained across
-the result-setting call (which needs `&mut self`) or escape the handler.
+Inside a host import handler, the guest's args are already lifetime-bounded by the callback —
+the *most defensible* place to expose borrowed guest memory. The import side now hands back
+the **same `Lifted` accessor** as export results, so the host picks `view` (zero-copy),
+`copy` (owned), or `val` (dynamic) per arg. `args()` borrows `&self`, so any view it yields
+cannot be retained across a later `set` (which needs `&mut self`) or escape the handler —
+the natural read-inputs-then-write-outputs ordering falls straight out of the borrow checker.
 
-### Q4 — guest → host results (bulk lower) — `ImportCall::return_flat_list`
+### Q4 — guest → host results (lower) — `ImportCall::set(i, Source)`
 
-The mirror of Q1's lowering, from inside the import handler. Two directions:
+The mirror of Q1's provide side, from inside the import handler, taking the **same `Source`**
+(so results can be `Flat` *or* `Val`, per slot). One remaining sub-direction on how the flat
+bytes reach guest memory:
 
-- **(a) Hand over host bytes** — `return_flat_list(i, &[u8])`; Wasmtime allocs in guest
-  memory and copies. Simple; one intermediate host buffer.
-- **(b) Fill a guest buffer** — `flat_list_writer(i, count) -> &mut [u8]`; the host writes
-  the canonical image *directly* into guest memory, no intermediate host `Vec`.
+- **(a) Hand over host bytes** — `set(i, Source::Flat(&bytes))`; Wasmtime allocs in guest
+  memory and copies. Simple; one intermediate host buffer. *(What the sim implements.)*
+- **(b) Fill a guest buffer** — a future `result_writer(i, count) -> &mut [u8]`; the host
+  writes the canonical image *directly* into guest memory, no intermediate host `Vec`.
 
-**Recommendation:** ship **(a)** first (it's the obvious mirror and what the sim models),
-and offer **(b)** as the zero-intermediate-copy path. (b) is the natural sibling of
-caller-supplied result buffers ([component-model#369]) and pays off when the host computes
-results in place.
+**Recommendation:** (a) is the shipped default; offer (b) as the zero-intermediate-copy path
+— the natural sibling of caller-supplied result buffers ([component-model#369]), paying off
+when the host computes results in place.
 
 [component-model#369]: https://github.com/WebAssembly/component-model/issues/369
+
+### Why the two sides are still not *perfectly* symmetric — and why that's right
+
+The export side keeps a **prepare-time spec** (`ArgSpec` → validated `Tier`), because a host
+loop reuses one `PreparedCall` thousands of times and wants shape validation hoisted out of
+the hot path (§2). The import side chooses representation **per call, inside the handler**,
+because there is no host-driven reuse loop — the *guest* drives, and the handler already runs
+per call. So "provide/receive" is fully symmetric, but "validate once vs decide per call" is
+deliberately not: it tracks who is looping. (A `PreparedImport` could hoist the import-result
+validation too if a hot guest→host path ever wants it.)
 
 ---
 
@@ -202,7 +245,7 @@ reinforce one design rule.
   suspension — which is *required* once the guest can suspend mid-call. The prepared/bound
   split maps cleanly: `PreparedCall` stays reusable/`Send`, the future owns `'a`.
 - **Scoped results extend to async scopes.** `invoke_scoped` with an async closure
-  (`FnOnce(Results) -> impl Future`) lets the borrowed view span `.await` points, with
+  (`FnOnce(&Lifted) -> impl Future`) lets the borrowed view span `.await` points, with
   Wasmtime keeping guest memory valid and deferring post-return cleanup until the scope
   completes. A freely-returned guard (Q2 direction 2) would be *unsound* here — another
   guest call during the await could move or free the memory. This is the strongest argument
@@ -228,10 +271,13 @@ forward-compatible with the world we expect.
 
 ## 7. Summary of recommendations
 
-1. Treat **bulk lower / bulk lift of `list<flat T>`** as *the* primitive; the four
-   quadrants are four surfaces over it, gated by the flat-type reflection check.
+1. Treat **lower / lift** as the two operations and **`Source` / `Lifted`** as the two
+   reused vocabularies; the four cells are surfaces over that one pair. *Flat* (bulk memcpy,
+   incl. a single pre-lowered value) vs *`Val`* is a **per-slot representation choice**, so
+   a call mixes bulk and dynamic freely; the flat path is gated by the reflection check.
 2. Keep the **prepared-shape / bound-call split** — it exactly matches the once-vs-per-call
-   cost frequencies in §2.
+   cost frequencies in §2 — but only on the export side, where the host loops; the import
+   side chooses representation per call (§4).
 3. Names: **`PreparedCall` → `.bind()` → `BoundCall` → `.invoke()`**, `CallShape` as the
    fallback if "prepared" stays ambiguous; add **`PreparedImport`** for import-side symmetry.
 4. Results (Q2) and import args (Q3): **scoped borrowed view as the primitive, eager

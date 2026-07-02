@@ -120,6 +120,23 @@ pub enum Val {
     List(Vec<Val>),
 }
 
+/// How the host *provides* a value to be **lowered** into guest memory — the shared
+/// "provide" vocabulary used for both host→guest params and guest→host results.
+///
+/// The representation is chosen per slot, so one call freely mixes them:
+///
+/// * [`Source::Flat`] — the caller already holds the canonical (CABI-encoded) bytes, and
+///   they are copied in as one `memcpy`. This covers a whole `list<flat T>` **and** a
+///   single pre-lowered value/record; the arity comes from the slot's [`Ty`].
+/// * [`Source::Val`] — a dynamic value walked element-by-element (the general/slow path).
+///
+/// (A future `Source::Lazy` would defer the copy to a pull *during* the call; see
+/// `DESIGN.md`. It slots in here without changing the borrow structure.)
+pub enum Source<'a> {
+    Flat(&'a [u8]),
+    Val(Val),
+}
+
 /// A flattened core value (post-canonicalisation param/result). A `list` flattens to an
 /// `I32` pointer plus an `I32` length.
 #[derive(Clone, Copy, Debug)]
@@ -277,7 +294,6 @@ impl<'a> Caller<'a> {
             param_tys: &import.params,
             result_tys: &import.results,
             args: core_args.to_vec(),
-            arg_slots: core_slot_offsets(&import.params),
             outs: (0..import.results.len()).map(|_| None).collect(),
         };
         (import.handler)(&mut ic);
@@ -288,51 +304,124 @@ impl<'a> Caller<'a> {
 /// The handle passed to a host import handler. It borrows the guest's `Store` for the
 /// duration of the callback only, which is exactly the natural lifetime boundary #13
 /// highlights: views handed out here cannot escape the callback.
+///
+/// Its two halves mirror the two dual vocabularies: [`args`](Self::args) hands back a
+/// [`Lifted`] accessor to *receive* the guest's params (pick `view`/`copy`/`val` per
+/// slot), and [`set`](Self::set) *provides* each result via a [`Source`] (pick
+/// `Flat`/`Val` per slot). Reading args (`&self`) and setting results (`&mut self`) are
+/// naturally sequenced by the borrow checker, so a borrowed arg view cannot straddle a
+/// result write.
 pub struct ImportCall<'s> {
     store: &'s mut Store,
     param_tys: &'s [Ty],
     result_tys: &'s [Ty],
     args: Vec<CoreVal>,
-    arg_slots: Vec<usize>,
-    outs: Vec<Option<Vec<u8>>>,
+    outs: Vec<Option<Vec<CoreVal>>>,
 }
 
-impl<'s> ImportCall<'s> {
-    /// **Quadrant 3 (guest -> host params, bulk lift).** Borrow the flat bytes of the
-    /// guest-provided `list<flat T>` argument `index` as a callback-scoped view. The
-    /// borrow is tied to `&self`, so it cannot be retained across a later
-    /// [`return_flat_list`](Self::return_flat_list) (which needs `&mut self`) or escape
-    /// the handler.
-    pub fn arg_list_view(&self, index: usize) -> &[u8] {
-        let ty = &self.param_tys[index];
-        assert!(ty.is_bulk_transferable(), "arg {index} is not flat-transferable");
-        let slot = self.arg_slots[index];
-        let ptr = self.args[slot].as_i32() as usize;
-        let count = self.args[slot + 1].as_i32() as usize;
-        lift_flat_view(self.store, ty, ptr, count)
+impl ImportCall<'_> {
+    /// **Guest → host params (lift).** A scoped accessor over the guest-provided
+    /// arguments. The borrow is tied to `&self`, so the views it yields cannot be retained
+    /// across a later [`set`](Self::set) (which needs `&mut self`) or escape the handler.
+    pub fn args(&self) -> Lifted<'_> {
+        Lifted::new(self.store, self.param_tys, &self.args)
     }
 
-    /// **Quadrant 4 (guest -> host results, bulk lower).** Provide host-owned bytes as
-    /// the flat `list<flat T>` result `index`. They are copied into guest memory when the
-    /// handler returns.
-    pub fn return_flat_list(&mut self, index: usize, bytes: &[u8]) {
+    /// **Guest → host results (lower).** Provide result `index` from any [`Source`] (flat
+    /// bytes or a `Val`). It is lowered into guest memory immediately; the resulting core
+    /// values are handed back to the guest when the handler returns.
+    pub fn set(&mut self, index: usize, src: Source) {
         let ty = &self.result_tys[index];
-        assert!(ty.is_bulk_transferable(), "result {index} is not flat-transferable");
-        self.outs[index] = Some(bytes.to_vec());
+        self.outs[index] = Some(lower_source(self.store, ty, src));
     }
 
-    /// Lower every host-provided result list into guest memory and hand back the core
-    /// (ptr, len) values the guest will receive.
+    /// Assemble the flattened core results in slot order.
     fn finish(self) -> Vec<CoreVal> {
         let mut core = Vec::new();
         for (i, out) in self.outs.into_iter().enumerate() {
-            let ty = &self.result_tys[i];
-            let bytes = out.unwrap_or_else(|| panic!("host did not set result {i}"));
-            let (ptr, count) = lower_flat(self.store, ty, &bytes);
-            core.push(CoreVal::I32(ptr as i32));
-            core.push(CoreVal::I32(count as i32));
+            core.extend(out.unwrap_or_else(|| panic!("host did not set result {i}")));
         }
         core
+    }
+}
+
+/// Guest-owned values exposed for **lifting**, with the representation chosen *at the pull
+/// site* — the shared "receive" vocabulary used for both host→guest results and
+/// guest→host params. The same value can be pulled more than one way.
+///
+/// `view`/`copy` apply to `list<flat T>` slots (a contiguous canonical image); `val`
+/// works for any slot by walking it into a [`Val`].
+pub struct Lifted<'a> {
+    store: &'a Store,
+    tys: &'a [Ty],
+    core: &'a [CoreVal],
+    slots: Vec<usize>,
+}
+
+impl<'a> Lifted<'a> {
+    pub(crate) fn new(store: &'a Store, tys: &'a [Ty], core: &'a [CoreVal]) -> Self {
+        Lifted {
+            store,
+            tys,
+            core,
+            slots: core_slot_offsets(tys),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tys.is_empty()
+    }
+
+    fn list_ptr_count(&self, index: usize) -> (usize, usize) {
+        let slot = self.slots[index];
+        (
+            self.core[slot].as_i32() as usize,
+            self.core[slot + 1].as_i32() as usize,
+        )
+    }
+
+    /// **Zero-copy** borrowed view of the flat bytes of `list<flat T>` slot `index`. The
+    /// borrow is tied to `&self`, i.e. to the enclosing scope / handler.
+    pub fn view(&self, index: usize) -> &[u8] {
+        let ty = &self.tys[index];
+        assert!(ty.is_bulk_transferable(), "slot {index} is not flat-transferable");
+        let (ptr, count) = self.list_ptr_count(index);
+        lift_flat_view(self.store, ty, ptr, count)
+    }
+
+    /// Copy slot `index` out into host-owned bytes.
+    pub fn copy(&self, index: usize) -> Vec<u8> {
+        self.view(index).to_vec()
+    }
+
+    /// Lift slot `index` into a dynamic [`Val`] by walking it element-by-element (the
+    /// general/slow path, and the only one that works for non-flat shapes).
+    pub fn val(&self, index: usize) -> Val {
+        let ty = &self.tys[index];
+        let slot = self.slots[index];
+        match ty {
+            Ty::List(elem) => {
+                let (ptr, count) = self.list_ptr_count(index);
+                let stride = elem.size();
+                let mut items = Vec::with_capacity(count);
+                let mut off = ptr;
+                for _ in 0..count {
+                    items.push(lift_scalar_or_record(self.store, elem, off));
+                    off += stride;
+                }
+                Val::List(items)
+            }
+            Ty::F32 => match self.core[slot] {
+                CoreVal::F32(x) => Val::F32(x),
+                CoreVal::I32(x) => Val::F32(f32::from_bits(x as u32)),
+            },
+            Ty::U32 => Val::U32(self.core[slot].as_i32() as u32),
+            other => panic!("lifting {other:?} to a Val is not modelled"),
+        }
     }
 }
 
@@ -362,13 +451,6 @@ pub(crate) fn lower_flat(store: &mut Store, ty: &Ty, bytes: &[u8]) -> (usize, us
     (ptr, count)
 }
 
-/// **bulk LIFT (owned).** Copy `count` flat elements out of guest memory into a fresh
-/// host-owned byte image. The shared primitive behind *host->guest results* (eager
-/// copy-out) and *guest->host params* (when the host wants to keep the bytes).
-pub(crate) fn lift_flat(store: &Store, ty: &Ty, ptr: usize, count: usize) -> Vec<u8> {
-    lift_flat_view(store, ty, ptr, count).to_vec()
-}
-
 /// **bulk LIFT (borrowed view).** Borrow `count` flat elements of guest memory in place —
 /// zero copy. The caller controls the dynamic extent in which the view is valid; here
 /// that is enforced structurally by the borrow of `&Store`.
@@ -394,7 +476,69 @@ pub(crate) fn lower_val(store: &mut Store, ty: &Ty, val: &Val, core: &mut Vec<Co
             core.push(CoreVal::I32(ptr as i32));
             core.push(CoreVal::I32(items.len() as i32));
         }
+        // A record passed *by value* flattens its fields straight into core values.
+        (Ty::Record(fields), Val::Record(vals)) => {
+            for (fty, fval) in fields.iter().zip(vals) {
+                lower_val(store, fty, fval, core);
+            }
+        }
         _ => panic!("val/type mismatch during lowering"),
+    }
+}
+
+/// Lower one value from any [`Source`], returning its flattened core representation. The
+/// single choke point behind both *host→guest params* and *guest→host results*.
+pub(crate) fn lower_source(store: &mut Store, ty: &Ty, src: Source) -> Vec<CoreVal> {
+    let mut core = Vec::new();
+    match src {
+        Source::Flat(bytes) => lower_flat_image(store, ty, bytes, &mut core),
+        Source::Val(v) => lower_val(store, ty, &v, &mut core),
+    }
+    core
+}
+
+/// Lower pre-encoded canonical bytes. A `list<flat T>` image is copied into memory as one
+/// `memcpy` and represented by (ptr, len); a **single** pre-lowered value/record is
+/// flattened straight into core values, no allocation. Either way the caller skips
+/// building a [`Val`] tree.
+fn lower_flat_image(store: &mut Store, ty: &Ty, bytes: &[u8], core: &mut Vec<CoreVal>) {
+    match ty {
+        Ty::List(_) => {
+            let (ptr, len) = lower_flat(store, ty, bytes);
+            core.push(CoreVal::I32(ptr as i32));
+            core.push(CoreVal::I32(len as i32));
+        }
+        _ => {
+            flatten_image(ty, bytes, 0, core);
+        }
+    }
+}
+
+/// Read a single value's canonical memory image out of `bytes` at `off`, flattening it to
+/// core values. Returns the offset just past the value.
+fn flatten_image(ty: &Ty, bytes: &[u8], off: usize, core: &mut Vec<CoreVal>) -> usize {
+    match ty {
+        Ty::F32 => {
+            core.push(CoreVal::F32(f32::from_le_bytes(
+                bytes[off..off + 4].try_into().unwrap(),
+            )));
+            off + 4
+        }
+        Ty::U32 => {
+            core.push(CoreVal::I32(i32::from_le_bytes(
+                bytes[off..off + 4].try_into().unwrap(),
+            )));
+            off + 4
+        }
+        Ty::Record(fields) => {
+            let mut o = off;
+            for f in fields {
+                o = align_up(o, f.align());
+                o = flatten_image(f, bytes, o, core);
+            }
+            align_up(o, ty.align())
+        }
+        other => panic!("flattening {other:?} from an image is not modelled"),
     }
 }
 
@@ -411,5 +555,27 @@ fn store_scalar_or_record(store: &mut Store, ty: &Ty, val: &Val, off: usize) {
             }
         }
         _ => panic!("val/type mismatch during element store"),
+    }
+}
+
+/// Lift one in-memory value (scalar or record) into a [`Val`] — the inverse of
+/// [`store_scalar_or_record`], used to walk `list<T>` elements into a `Val::List`.
+fn lift_scalar_or_record(store: &Store, ty: &Ty, off: usize) -> Val {
+    match ty {
+        Ty::F32 => Val::F32(store.read_f32(off)),
+        Ty::U32 => Val::U32(u32::from_le_bytes(
+            store.mem[off..off + 4].try_into().unwrap(),
+        )),
+        Ty::Record(fields) => {
+            let mut o = off;
+            let mut vals = Vec::with_capacity(fields.len());
+            for f in fields {
+                o = align_up(o, f.align());
+                vals.push(lift_scalar_or_record(store, f, o));
+                o += f.size();
+            }
+            Val::Record(vals)
+        }
+        other => panic!("lifting {other:?} to a Val is not modelled"),
     }
 }
