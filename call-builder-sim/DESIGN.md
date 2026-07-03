@@ -374,6 +374,8 @@ pub enum ArgSource<'a> {
     FlatInOut(&'a mut [u8]),                       // read-write column, copied back — DEFERRED (§8 caveat)
     Stream(&'a mut dyn Producer),                  // fed incrementally, pulled during the call (#12, §9.1)
     // …future: Buffer(&'a TypedBuffer, Range<usize>) — a checked slice of a typed buffer (#15, §9.2)
+    // …future: Lowerable(&'a dyn Lower) — any statically-typed value that lowers itself, i.e. a
+    //   `bindgen!`-generated type or a primitive. The mechanism for CORE-2 (§9.3).
 }
 pub enum Source<'a> { Val(Val), Flat(&'a [u8]) }   // provide, import side (no in-out on results)
 
@@ -656,17 +658,57 @@ every `ArgSource::Buffer` checks that id against the slot it's used with, so a b
 for `vec2` can never be silently fed to a call expecting something else — it explodes early
 (SAFE-4: a structural mismatch, caught at bind).
 
+### 9.3 A generic lowerable source: bindgen interop (CORE-2)
+
+**Use case.** Pass a *statically-typed* Rust value — a `bindgen!`-generated struct, or a
+primitive — directly as an argument, letting its generated `Lower` impl do the encoding, mixed
+with `Val` / `Flat` / `Stream` in one call.
+
+**Is it a valid source? Yes.** `Lower` *is* "a value that knows how to lower itself into the
+canonical ABI," so a `Lowerable` source is just a fourth point on the spectrum of **how
+pre-processed the value is**:
+
+| source | typing | who encodes | cost |
+| --- | --- | --- | --- |
+| `Val` | dynamic (runtime) | runtime, per element | slowest, most flexible |
+| **`Lowerable`** | **static (`T: Lower`)** | **generated (monomorphised) lowering** | **no pre-encoding; bindgen-fast** |
+| `Flat` | static (you) | you, ahead of time | one `memcpy` — fastest |
+| `Stream` | static, incremental | you, in chunks | pull-based |
+
+So `Lowerable` is the concrete **mechanism for CORE-2** (bindgen interop) — previously a
+hand-wave, now a variant. It's the bridge between the dynamic call-builder and bindgen's static
+world: hand a real Rust value for one arg, a flat column for another, a `Val` for a third.
+
+**Borrow story.** `&'a dyn Lower` is a shared borrow held for the call and lowered during
+`invoke` — the same shape as `Flat`, so it fits the whole-call rule with nothing new.
+
+**Caveat (the honest bit).** wasmtime's `Lower` is generic over the store type, so it is *not
+object-safe* — `&dyn Lower` won't compile as written. The real form is a generic builder method
+that erases the concrete lowering into a thunk:
+
+```rust
+// convenience, monomorphised per T; captures a type-erased lowering closure into the variant:
+pub fn arg_lowerable<T: Lower>(self, value: &'a T) -> Self;
+// ArgSource::Lowerable then carries e.g. Box<dyn FnOnce(&mut LowerContext) -> Result<()> + 'a>
+```
+
+The enum variant is the erased form; the `arg_lowerable<T>` method is where monomorphisation
+happens. That's a small wrinkle, not a blocker — and it's exactly the kind of variant that
+`#[non_exhaustive]` (§8) exists to let us add later without breaking callers.
+
 ### What the stress tests tell us
 
-- Both features are **purely additive** — a new `ArgSource` variant (+ trait) for #12, a new
-  type straddling the provide/receive vocabularies for #15. The four core surfaces are
-  untouched, and because `ArgSource`/`ArgSpec` are `#[non_exhaustive]` (§8), adding the
-  variants is non-breaking for existing callers.
+- All three are **purely additive** — a new `ArgSource` variant (+ trait) for #12, a new type
+  straddling the provide/receive vocabularies for #15, a new variant (+ generic method) for
+  §9.3. The four core surfaces are untouched, and because `ArgSource`/`ArgSpec` are
+  `#[non_exhaustive]` (§8), adding the variants is non-breaking for existing callers.
 - #12 **validates** the whole-call borrow rule (§5–6): a stream is just an arg whose lowering
   is spread across the call, and the rule already covers it.
 - #15 **realises** CORE-8 and PERF-2 at the data level, and slots a `TypedBuffer` in as both
   a `Buffer` arg source and an `append_to` result sink — the same "one vocabulary, reused"
   story as the four cells.
+- §9.3 **upgrades CORE-2** from an aspiration to a mechanism: a `Lowerable` source gives
+  bindgen's `Lower` a first-class seat at the dynamic call, alongside `Val`/`Flat`/`Stream`.
 
 **#12 is now implemented in the sim** (§9.1), which pinned the borrow story down concretely
 and even surfaced a detail prose missed (the two-lifetime `Caller`). **#15 is still a
