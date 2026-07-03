@@ -345,7 +345,10 @@ data-dependent errors; only a genuine contract violation panics.
 - Import: `Linker::func_new_transfer`, `ImportCall::args`, `ImportCall::set`.
 
 Every other method below is a **convenience** that desugars to a core call (shown inline).
-The two enums (`ArgSource`, `Source`) *are* core — they're the provide vocabulary, not sugar.
+The two enums (`ArgSource`, `Source`) *are* core — they're the provide vocabulary, not sugar —
+and `ArgSource`/`ArgSpec` are **`#[non_exhaustive]`**: that's what lets §9's new sources
+(`Stream`, a future `Buffer`) land additively, without breaking any caller's match or
+construction. `Stream` is already implemented (§9.1); `FlatInOut` is deferred (caveat below).
 
 ```rust
 use wasmtime::component::{self, Val};
@@ -360,12 +363,17 @@ impl component::Type {
     pub fn is_cabi_inline(&self) -> bool;
 }
 
-// Provide vocabulary (lower) — both enums are core.
-pub enum ArgSpec { Val, Flat, FlatInOut }          // representation, fixed at prepare time
-pub enum ArgSource<'a> {                           //   (FlatInOut is DEFERRED — see caveat)
+// Provide vocabulary (lower) — both enums are core, and `#[non_exhaustive]` so new sources
+// (streaming, typed buffers, …) can be added additively without breaking callers (see §9).
+#[non_exhaustive]
+pub enum ArgSpec { Val, Flat, FlatInOut, Stream }  // representation, fixed at prepare time
+#[non_exhaustive]
+pub enum ArgSource<'a> {
     Val(Val),
     Flat(&'a [u8]),                                // pre-encoded CABI bytes: one value OR a list image
-    FlatInOut(&'a mut [u8]),                       // read-write column, copied back after the call — DEFERRED
+    FlatInOut(&'a mut [u8]),                       // read-write column, copied back — DEFERRED (§8 caveat)
+    Stream(&'a mut dyn Producer),                  // fed incrementally, pulled during the call (#12, §9.1)
+    // …future: Buffer(&'a TypedBuffer, Range<usize>) — a checked slice of a typed buffer (#15, §9.2)
 }
 pub enum Source<'a> { Val(Val), Flat(&'a [u8]) }   // provide, import side (no in-out on results)
 
@@ -652,7 +660,8 @@ for `vec2` can never be silently fed to a call expecting something else — it e
 
 - Both features are **purely additive** — a new `ArgSource` variant (+ trait) for #12, a new
   type straddling the provide/receive vocabularies for #15. The four core surfaces are
-  untouched.
+  untouched, and because `ArgSource`/`ArgSpec` are `#[non_exhaustive]` (§8), adding the
+  variants is non-breaking for existing callers.
 - #12 **validates** the whole-call borrow rule (§5–6): a stream is just an arg whose lowering
   is spread across the call, and the rule already covers it.
 - #15 **realises** CORE-8 and PERF-2 at the data level, and slots a `TypedBuffer` in as both
