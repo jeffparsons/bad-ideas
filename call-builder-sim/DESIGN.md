@@ -717,3 +717,68 @@ round trip across two instances.
 
 [#12]: https://github.com/jeffparsons/bad-ideas/issues/12
 [#15]: https://github.com/jeffparsons/bad-ideas/issues/15
+
+## 10. The `ValSource` redesign (issue #16)
+
+Issue #16 reframed the provide side: instead of a top-level `ArgSource` enum (one
+representation per parameter), the source becomes a **recursive `ValSource` tree** where
+every *node* independently picks how it supplies its bytes. The old §1–§9 sketch (with
+`ArgSource`/`ArgSpec` and its `#[non_exhaustive]` growth story) is superseded on the provide
+side by this; the receive side (`Lifted`/`get::<T>`) and the guest→host round-trip are
+unchanged. **This section is implemented and proven in the crate** (`src/main.rs`,
+`src/call_builder.rs`); see [`IMPLEMENTATION-NOTES.md`](./IMPLEMENTATION-NOTES.md).
+
+```rust
+enum ValSource<'a> {
+    Val(Val),                          // dynamic + owned — the simple case is the all-Val tree
+    Flat(ValidatedCabiBytes<'a>),      // proof-carrying canonical bytes; one memcpy
+    Record(Vec<ValSource<'a>>),        // per-field sources — mix representations within a value
+    List(ListSource<'a>),              // Flat(ValidatedCabiBytes) | Elems(Vec<ValSource>)
+    Stream(&'a mut dyn Producer),      // stream<T> — a distinct CM type, its own node
+    Lazy(&'a mut dyn LowerOnDemand),   // host-computed random-access range producer
+    Arena(ArenaSlice<'a>),             // slice of a pre-validated, host-native flattened store
+}
+```
+
+### 10.1 The keystone — one op, both worlds
+
+Every list-capable source implements a single random-access operation: *produce elements
+`[start, start+count)`*. That is the whole trick behind **"same API, both worlds"**:
+
+- **eager** (today): the runtime calls `produce_range(0, len)` once, memcpys the result into
+  guest memory, then calls the guest — `BoundCall::invoke`.
+- **lazy** ([component-model#383]): the guest pulls `value.lower` ranges; the runtime routes
+  each pull to the same `produce_range` — modelled by `drive_lazy`.
+
+Eager is the *strict special case*: "call every producer once, fully, up front." The
+embedder writes the identical tree either way. `demo_both_worlds` drives one archetype
+column both ways and asserts **byte-identical** output; it also shows a projected-away
+`velocity` field is *never touched* and a lazy window produces *only* its 64 elements
+(#383's free skips). Per the issue-#16 confirmation, a `LowerOnDemand` impl owns its own
+caching policy — the runtime only ever calls `produce_range`.
+
+### 10.2 `is_inline` splits in two (property A vs B)
+
+A raw `memcpy` of caller bytes is *memory-safe* iff the type is `is_cabi_inline` (fixed
+layout, no out-of-line storage/ownership — **A**), but *complete* only iff it is also
+`are_all_bit_patterns_valid` (**B**): every bit pattern is a valid value. `Enum` is A-but-not-B
+(a discriminant `>= cases` is a safe byte pattern but an invalid value), so it needs a
+validation sweep. That sweep lives behind the **`ValidatedCabiBytes`** wrapper — minting is
+O(1) for B-types and a linear scan otherwise; an invalid image is rejected at construction,
+so it can never reach the memcpy path. This replaced the earlier `trusted: bool` smell.
+
+### 10.3 The arena (Q2 = host-native)
+
+`Arena` holds a **pre-validated, host-native flattened** run: the `are_all_bit_patterns_valid`
+sweep is paid **once** at `absorb`, and slices replayed into later calls re-check nothing —
+the conduit (receive from A → provide to B) with a single validated copy. Modelled at a
+single level (element `k` at `k*stride`, pure arithmetic); overlay offset tables only arise
+at *depth* (multi-list-deep), noted but not built.
+
+### 10.4 Resolved forks
+
+Q1 validate the reusable `ValSpec` **shape** once at `prepare` (implemented). Q2 arena
+**host-native** + on-demand overlay tables (implemented single-level). Q3 **both** owning
+(`ValidatedCabiBytesBuf`) and borrowing (`ValidatedCabiBytes`) wrappers (implemented).
+
+[component-model#383]: https://github.com/WebAssembly/component-model/issues/383

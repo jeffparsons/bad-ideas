@@ -1,59 +1,44 @@
-//! Demo: exercise all four quadrants of the canonical-ABI transfer matrix through the
-//! fake component boundary, checking every result against a plain native computation.
+//! Demos for the **`ValSource`** provide surface (issue #16). Each proves one claim from
+//! the design discussion against a plain native reference:
 //!
-//! * **Quadrant 1** — host → guest *params* (bulk lower): an ECS integrate step, mixing a
-//!   `Val` arg with two flat read-write columns, reusing one `PreparedCall` across steps.
-//! * **Quadrant 2** — host → guest *results* (bulk lift): a guest that *returns* a list,
-//!   read back both as a zero-copy scoped view and as an eager copy-out.
-//! * **Quadrants 3 & 4** — guest → host *params* and *results* (bulk lift + bulk lower):
-//!   a guest that calls a host import, which reads the guest's list as a borrowed view
-//!   and writes its own list result back into guest memory.
-//!
-//! The final pipeline threads a single value through all four quadrants at once.
+//! 1. `demo_simple` — the degenerate all-`Val` tree still works (nothing regressed).
+//! 2. `demo_two_backings` — same guest, `list` as flat bytes vs `Elems([Val…])` →
+//!    **byte-identical** guest data (guest-obliviousness).
+//! 3. `demo_composite` — per-node mixing *within one composite* (Flat + Val fields).
+//! 4. `demo_both_worlds` — ONE `ValSource` tree driven **eager vs lazy**, byte-identical;
+//!    archetype AoS `Lazy` columns with `velocity` projected out (never touched); a lazy
+//!    window pulls *only* the window.
+//! 5. `demo_arena_validity` — `ValidatedCabiBytes` (free for total types, sweep for `Enum`,
+//!    rejects bad discriminants) + an arena validated **once**.
 
-use call_builder_sim::call_builder::{ArgSpec, PreparedCall};
+use std::cell::Cell;
+
+use call_builder_sim::call_builder::{
+    drive_eager, drive_lazy, Arena, ListSource, LowerOnDemand, PreparedCall, ValSpec, ValSource,
+};
 use call_builder_sim::fake_wasmtime::{
-    Caller, CoreVal, Func, HostImport, Producer, Source, Store, Ty, Val,
+    Caller, CoreVal, Func, Producer, Store, Ty, Val, ValidatedCabiBytes,
 };
 
-const N: usize = 1_000; // entities
-const STEPS: usize = 100;
-const DT: f32 = 0.01;
+const N: usize = 1_000;
 
 fn vec2_ty() -> Ty {
     Ty::Record(vec![Ty::F32, Ty::F32])
 }
-
 fn list_of_vec2() -> Ty {
     Ty::List(Box::new(vec2_ty()))
 }
-
-/// One semi-implicit Euler step toward the origin (same shape as the benchmark scenario).
-fn step(px: f32, py: f32, vx: f32, vy: f32, dt: f32) -> (f32, f32, f32, f32) {
-    let len = (px * px + py * py).sqrt();
-    let (ax, ay) = if len > 0.0 {
-        (-px / len, -py / len)
-    } else {
-        (0.0, 0.0)
-    };
-    let nvx = vx + ax * dt;
-    let nvy = vy + ay * dt;
-    (px + nvx * dt, py + nvy * dt, nvx, nvy)
+fn list_of_f32() -> Ty {
+    Ty::List(Box::new(Ty::F32))
 }
 
-fn normalize(x: f32, y: f32) -> (f32, f32) {
-    let len = (x * x + y * y).sqrt();
-    if len > 0.0 {
-        (x / len, y / len)
-    } else {
-        (0.0, 0.0)
-    }
+fn read_f32(bytes: &[u8], at: usize) -> f32 {
+    f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
-
-/// Deterministic initial column of `N` `vec2`s as raw little-endian bytes.
-fn initial(mut s: u32) -> Vec<u8> {
-    let mut out = Vec::with_capacity(N * 8);
-    for _ in 0..N * 2 {
+/// Deterministic little-endian bytes of `n` f32s from a tiny xorshift PRNG.
+fn rng_f32s(mut s: u32, n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n * 4);
+    for _ in 0..n {
         s ^= s << 13;
         s ^= s >> 17;
         s ^= s << 5;
@@ -63,345 +48,473 @@ fn initial(mut s: u32) -> Vec<u8> {
     out
 }
 
-fn read_f32(bytes: &[u8], at: usize) -> f32 {
-    f32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+// =======================================================================================
+// 1. The degenerate all-`Val` tree is the simple case.
+// =======================================================================================
+
+/// A guest taking `list<vec2>` and returning a one-element `list<f32>`: Σ of all components.
+fn sum_components_func() -> std::rc::Rc<Func> {
+    Func::new(
+        vec![list_of_vec2()],
+        vec![list_of_f32()],
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
+            let ptr = core[0].as_i32() as usize;
+            let count = core[1].as_i32() as usize;
+            let s = caller.store();
+            let mut sum = 0.0f32;
+            for i in 0..count {
+                sum += s.read_f32(ptr + i * 8) + s.read_f32(ptr + i * 8 + 4);
+            }
+            let out = s.realloc(4, 4);
+            s.write_f32(out, sum);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
+        },
+    )
 }
 
-fn write_f32(bytes: &mut [u8], at: usize, v: f32) {
-    bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
+fn demo_simple() {
+    let raw = rng_f32s(0x1234_5678, N * 2); // N vec2s
+    // Reference in the guest's exact f32 order (per vec2: x + y, accumulated).
+    let mut native = 0.0f32;
+    for c in raw.chunks_exact(8) {
+        native += read_f32(c, 0) + read_f32(c, 4);
+    }
+
+    let func = sum_components_func();
+    let prepared = PreparedCall::new(&func, &[ValSpec::ListElems(Box::new(ValSpec::Val))]).unwrap();
+    let mut store = Store::new(N * 8 * 2 + 4096);
+
+    // Build the list purely out of dynamic Vals — the "simple API", now a ValSource tree.
+    let elems: Vec<ValSource> = raw
+        .chunks_exact(8)
+        .map(|c| {
+            ValSource::Val(Val::Record(vec![
+                Val::F32(read_f32(c, 0)),
+                Val::F32(read_f32(c, 4)),
+            ]))
+        })
+        .collect();
+    let sum = prepared
+        .bind()
+        .arg(ValSource::List(ListSource::Elems(elems)))
+        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
+        .unwrap();
+
+    assert_eq!(native, sum, "all-Val tree must match native");
+    println!("  [1 simple]     all-`Val` tree OK          (Σ {sum:.3})");
 }
 
-/// Sum of every f32 component, folded in f64 (matches the benchmark's checksum idea).
-fn checksum(bytes: &[u8]) -> f64 {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
-        .sum()
+// =======================================================================================
+// 2. Guest-obliviousness: flat bytes vs Elems([Val…]) → byte-identical.
+// =======================================================================================
+
+fn demo_two_backings() {
+    let data: Vec<u32> = (0..N as u32).map(|i| i.wrapping_mul(2654435761)).collect();
+    let raw: Vec<u8> = data.iter().flat_map(|n| n.to_le_bytes()).collect();
+    let native: u32 = data.iter().copied().fold(0, u32::wrapping_add);
+    let u32_ty = Ty::U32;
+
+    // Prove byte-identity at the driver: the two backings produce the same bytes.
+    let vb = ValidatedCabiBytes::checked(&raw, &u32_ty).unwrap();
+    let mut flat = ValSource::List(ListSource::Flat(vb));
+    let elems: Vec<ValSource> = data.iter().map(|&n| ValSource::Val(Val::U32(n))).collect();
+    let mut per_elem = ValSource::List(ListSource::Elems(elems));
+    assert_eq!(
+        drive_eager(&mut flat, &Ty::U32),
+        drive_eager(&mut per_elem, &Ty::U32),
+        "flat vs per-element must produce byte-identical images"
+    );
+
+    // And prove it through a real guest call, both ways.
+    let func = Func::new(
+        vec![Ty::List(Box::new(Ty::U32))],
+        vec![Ty::List(Box::new(Ty::U32))],
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
+            let ptr = core[0].as_i32() as usize;
+            let count = core[1].as_i32() as usize;
+            let s = caller.store();
+            let mut sum = 0u32;
+            for i in 0..count {
+                sum = sum.wrapping_add(s.read_u32(ptr + i * 4));
+            }
+            let out = s.realloc(4, 4);
+            s.write_u32(out, sum);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
+        },
+    );
+    let mut store = Store::new(N * 4 * 2 + 4096);
+
+    let p_flat = PreparedCall::new(&func, &[ValSpec::ListFlat]).unwrap();
+    let vb = ValidatedCabiBytes::checked(&raw, &u32_ty).unwrap();
+    let sum_flat = p_flat
+        .bind()
+        .arg_list_flat(vb)
+        .invoke_scoped(&mut store, |r| {
+            u32::from_le_bytes(r.view(0)[0..4].try_into().unwrap())
+        })
+        .unwrap();
+
+    let p_elems = PreparedCall::new(&func, &[ValSpec::ListElems(Box::new(ValSpec::Val))]).unwrap();
+    let elems: Vec<ValSource> = data.iter().map(|&n| ValSource::Val(Val::U32(n))).collect();
+    let sum_elems = p_elems
+        .bind()
+        .arg(ValSource::List(ListSource::Elems(elems)))
+        .invoke_scoped(&mut store, |r| {
+            u32::from_le_bytes(r.view(0)[0..4].try_into().unwrap())
+        })
+        .unwrap();
+
+    assert_eq!(native, sum_flat, "flat backing must match native");
+    assert_eq!(native, sum_elems, "elems backing must match native");
+    println!("  [2 backings]   flat == Elems([Val…]) OK    (guest can't tell)");
 }
 
-// --- Quadrant 1: host -> guest params (bulk lower) -----------------------------------
+// =======================================================================================
+// 3. Per-node mixing within one composite: Record{ Flat, Flat, Val<Enum> }.
+// =======================================================================================
 
-fn native_integrate(mut pos: Vec<u8>, mut vel: Vec<u8>) -> f64 {
-    for _ in 0..STEPS {
-        for i in 0..N {
-            let (px, py) = (read_f32(&pos, i * 8), read_f32(&pos, i * 8 + 4));
-            let (vx, vy) = (read_f32(&vel, i * 8), read_f32(&vel, i * 8 + 4));
-            let (npx, npy, nvx, nvy) = step(px, py, vx, vy, DT);
-            write_f32(&mut pos, i * 8, npx);
-            write_f32(&mut pos, i * 8 + 4, npy);
-            write_f32(&mut vel, i * 8, nvx);
-            write_f32(&mut vel, i * 8 + 4, nvy);
+fn particle_ty() -> Ty {
+    // record { pos: vec2, vel: vec2, kind: enum(3) }  — all inline, 20 bytes.
+    Ty::Record(vec![vec2_ty(), vec2_ty(), Ty::Enum(3)])
+}
+
+fn demo_composite() {
+    let pos = rng_f32s(0xaaaa_1111, N * 2);
+    let vel = rng_f32s(0xbbbb_2222, N * 2);
+    let kinds: Vec<u32> = (0..N).map(|i| (i % 3) as u32).collect();
+    let vt = vec2_ty();
+
+    // Native: assemble each particle's canonical image and checksum the whole run.
+    let mut native_bytes = Vec::with_capacity(N * 20);
+    for i in 0..N {
+        native_bytes.extend_from_slice(&pos[i * 8..i * 8 + 8]);
+        native_bytes.extend_from_slice(&vel[i * 8..i * 8 + 8]);
+        native_bytes.extend_from_slice(&kinds[i].to_le_bytes());
+    }
+
+    // Build the list per-element, each particle a Record mixing Flat (pos, vel) + Val (kind).
+    let elems: Vec<ValSource> = (0..N)
+        .map(|i| {
+            let pos_vb = ValidatedCabiBytes::checked(&pos[i * 8..i * 8 + 8], &vt).unwrap();
+            let vel_vb = ValidatedCabiBytes::checked(&vel[i * 8..i * 8 + 8], &vt).unwrap();
+            ValSource::Record(vec![
+                ValSource::Flat(pos_vb),
+                ValSource::Flat(vel_vb),
+                ValSource::Val(Val::Enum(kinds[i])),
+            ])
+        })
+        .collect();
+    let mut mixed = ValSource::List(ListSource::Elems(elems));
+    let produced = drive_eager(&mut mixed, &particle_ty());
+
+    assert_eq!(
+        native_bytes, produced,
+        "per-field mixed composite must assemble the exact canonical image"
+    );
+
+    // A guest reads the mixed list and returns Σ(pos+vel components) + Σ(kind) as one f32.
+    let func = Func::new(
+        vec![Ty::List(Box::new(particle_ty()))],
+        vec![list_of_f32()],
+        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
+            let ptr = core[0].as_i32() as usize;
+            let count = core[1].as_i32() as usize;
+            let s = caller.store();
+            let mut acc = 0.0f32;
+            for i in 0..count {
+                let base = ptr + i * 20;
+                for k in 0..4 {
+                    acc += s.read_f32(base + k * 4); // pos.x pos.y vel.x vel.y
+                }
+                acc += s.read_u32(base + 16) as f32; // kind discriminant
+            }
+            let out = s.realloc(4, 4);
+            s.write_f32(out, acc);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
+        },
+    );
+    // Reference in the guest's exact f32 order (per particle: pos.x, pos.y, vel.x, vel.y, kind).
+    let mut native_acc = 0.0f32;
+    for (i, &kind) in kinds.iter().enumerate() {
+        native_acc += read_f32(&pos, i * 8);
+        native_acc += read_f32(&pos, i * 8 + 4);
+        native_acc += read_f32(&vel, i * 8);
+        native_acc += read_f32(&vel, i * 8 + 4);
+        native_acc += kind as f32;
+    }
+    let prepared = PreparedCall::new(
+        &func,
+        &[ValSpec::ListElems(Box::new(ValSpec::Record(vec![
+            ValSpec::Flat, // pos
+            ValSpec::Flat, // vel
+            ValSpec::Val,  // kind
+        ])))],
+    )
+    .unwrap();
+    let mut store = Store::new(N * 20 * 2 + 4096);
+    let elems: Vec<ValSource> = (0..N)
+        .map(|i| {
+            let pos_vb = ValidatedCabiBytes::checked(&pos[i * 8..i * 8 + 8], &vt).unwrap();
+            let vel_vb = ValidatedCabiBytes::checked(&vel[i * 8..i * 8 + 8], &vt).unwrap();
+            ValSource::Record(vec![
+                ValSource::Flat(pos_vb),
+                ValSource::Flat(vel_vb),
+                ValSource::Val(Val::Enum(kinds[i])),
+            ])
+        })
+        .collect();
+    let guest_acc = prepared
+        .bind()
+        .arg(ValSource::List(ListSource::Elems(elems)))
+        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
+        .unwrap();
+
+    assert_eq!(
+        native_acc, guest_acc,
+        "composite guest read must match native"
+    );
+    println!("  [3 composite]  Record{{Flat,Flat,Val<Enum>}} OK  (mixed within one value)");
+}
+
+// =======================================================================================
+// 4. Same API, both worlds — archetype projection via a Lazy source.
+// =======================================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+enum Field {
+    Position = 0,
+    Velocity = 1,
+    Acceleration = 2,
+}
+
+/// Host-side AoS storage: `count` entities, each `pos|vel|accel` (three vec2s, 24 bytes).
+/// Tracks which fields were ever read, to *prove* projection.
+struct Archetype {
+    bytes: Vec<u8>,
+    count: usize,
+    touched: [Cell<bool>; 3],
+}
+
+impl Archetype {
+    fn build(count: usize) -> Self {
+        let mut bytes = Vec::with_capacity(count * 24);
+        let (p, v, a) = (
+            rng_f32s(0x1111_0000, count * 2),
+            rng_f32s(0x2222_0000, count * 2),
+            rng_f32s(0x3333_0000, count * 2),
+        );
+        for i in 0..count {
+            bytes.extend_from_slice(&p[i * 8..i * 8 + 8]);
+            bytes.extend_from_slice(&v[i * 8..i * 8 + 8]);
+            bytes.extend_from_slice(&a[i * 8..i * 8 + 8]);
+        }
+        Archetype {
+            bytes,
+            count,
+            touched: std::array::from_fn(|_| Cell::new(false)),
         }
     }
-    checksum(&pos) + checksum(&vel)
+    fn read_vec2(&self, i: usize, field: Field) -> (f32, f32) {
+        self.touched[field as usize].set(true);
+        let off = i * 24 + (field as usize) * 8;
+        (read_f32(&self.bytes, off), read_f32(&self.bytes, off + 4))
+    }
+    fn touched(&self, field: Field) -> bool {
+        self.touched[field as usize].get()
+    }
+    fn reset_touched(&self) {
+        for c in &self.touched {
+            c.set(false);
+        }
+    }
 }
 
-fn demo_params() {
-    let mut positions = initial(0x1234_5678);
-    let mut velocities = initial(0x9abc_def0);
-    let native_sum = native_integrate(positions.clone(), velocities.clone());
-
-    // Guest: reads dt + the two columns from linear memory and mutates them in place.
-    let func = Func::new(
-        vec![Ty::F32, list_of_vec2(), list_of_vec2()],
-        vec![],
-        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
-            let dt = match core[0] {
-                CoreVal::F32(x) => x,
-                _ => unreachable!("param 0 is dt: f32"),
-            };
-            let pos_ptr = core[1].as_i32() as usize;
-            let count = core[2].as_i32() as usize;
-            let vel_ptr = core[3].as_i32() as usize;
-            let store = caller.store();
-            for i in 0..count {
-                let (pb, vb) = (pos_ptr + i * 8, vel_ptr + i * 8);
-                let (npx, npy, nvx, nvy) = step(
-                    store.read_f32(pb),
-                    store.read_f32(pb + 4),
-                    store.read_f32(vb),
-                    store.read_f32(vb + 4),
-                    dt,
-                );
-                store.write_f32(pb, npx);
-                store.write_f32(pb + 4, npy);
-                store.write_f32(vb, nvx);
-                store.write_f32(vb + 4, nvy);
-            }
-            vec![]
-        },
-    );
-
-    // Prepare ONCE: dt as a Val, the two columns as read-write flat buffers.
-    let prepared =
-        PreparedCall::new(&func, &[ArgSpec::Val, ArgSpec::FlatInOut, ArgSpec::FlatInOut]).unwrap();
-    let mut store = Store::new(N * 8 * 2 + 4096);
-
-    for _ in 0..STEPS {
-        prepared
-            .bind()
-            .arg_val(Val::F32(DT))
-            .arg_flat_inout(&mut positions)
-            .arg_flat_inout(&mut velocities)
-            .invoke(&mut store)
-            .unwrap();
-    }
-
-    let sim_sum = checksum(&positions) + checksum(&velocities);
-    print!("  arg tiers: ");
-    for (i, tier) in prepared.tiers().iter().enumerate() {
-        print!("arg{i}={tier:?} ");
-    }
-    println!();
-    assert_eq!(native_sum, sim_sum, "Q1 result must match native");
-    println!("  [Q1] host->guest params  OK  (checksum {sim_sum})");
+/// A `LowerOnDemand` that gathers one column out of the AoS archetype on demand. It chooses
+/// **not** to cache — it re-reads the archetype each pull (a valid policy; the API leaves
+/// caching to the impl). `produced` counts elements it was actually asked for.
+struct ArchetypeColumn<'a> {
+    arch: &'a Archetype,
+    field: Field,
+    produced: usize,
 }
 
-// --- Quadrant 2: host -> guest results (bulk lift) -----------------------------------
+impl<'a> ArchetypeColumn<'a> {
+    fn new(arch: &'a Archetype, field: Field) -> Self {
+        ArchetypeColumn {
+            arch,
+            field,
+            produced: 0,
+        }
+    }
+}
 
-fn demo_results() {
-    let positions = initial(0x0bad_1dea);
+impl LowerOnDemand for ArchetypeColumn<'_> {
+    fn len(&self) -> usize {
+        self.arch.count
+    }
+    fn produce_range(&mut self, start: usize, count: usize, out: &mut Vec<u8>) {
+        for i in start..start + count {
+            let (x, y) = self.arch.read_vec2(i, self.field);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            self.produced += 1;
+        }
+    }
+}
 
-    // Guest: returns a NEW list<vec2> of normalized positions (does not touch its input).
+fn demo_both_worlds() {
+    let arch = Archetype::build(N);
+    let vec2 = vec2_ty();
+
+    // --- Same ValSource tree, driven eager vs lazy → byte-identical ---
+    arch.reset_touched();
+    let mut col_e = ArchetypeColumn::new(&arch, Field::Position);
+    let eager = drive_eager(&mut ValSource::Lazy(&mut col_e), &vec2);
+
+    arch.reset_touched();
+    let mut col_l = ArchetypeColumn::new(&arch, Field::Position);
+    // The "guest" pulls the same column in three uneven chunks — its own schedule.
+    let lazy = drive_lazy(
+        &mut ValSource::Lazy(&mut col_l),
+        &vec2,
+        &[(0, 10), (10, N - 30), (N - 20, 20)],
+    );
+    assert_eq!(eager, lazy, "same tree, eager vs lazy → byte-identical");
+
+    // --- Projection: velocity is never a source, so it is never touched, in either world ---
+    assert!(!arch.touched(Field::Velocity), "velocity projected away — never read");
+
+    // --- Ground it in a real guest call: the archetype projection you described. The guest
+    // wants (positions, accelerations); velocity is stored but never sourced. Two Lazy
+    // columns gather from the AoS storage on demand. ---
     let func = Func::new(
-        vec![list_of_vec2()],
-        vec![list_of_vec2()],
+        vec![list_of_vec2(), list_of_vec2()],
+        vec![list_of_f32()],
         |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
-            let in_ptr = core[0].as_i32() as usize;
-            let count = core[1].as_i32() as usize;
-            let store = caller.store();
-            let out_ptr = store.realloc(count * 8, 4);
-            for i in 0..count {
-                let (x, y) = (store.read_f32(in_ptr + i * 8), store.read_f32(in_ptr + i * 8 + 4));
-                let (nx, ny) = normalize(x, y);
-                store.write_f32(out_ptr + i * 8, nx);
-                store.write_f32(out_ptr + i * 8 + 4, ny);
+            let (pp, pc) = (core[0].as_i32() as usize, core[1].as_i32() as usize);
+            let (ap, ac) = (core[2].as_i32() as usize, core[3].as_i32() as usize);
+            let s = caller.store();
+            let mut sum = 0.0f32;
+            for i in 0..pc {
+                sum += s.read_f32(pp + i * 8) + s.read_f32(pp + i * 8 + 4);
             }
-            vec![CoreVal::I32(out_ptr as i32), CoreVal::I32(count as i32)]
+            for i in 0..ac {
+                sum += s.read_f32(ap + i * 8) + s.read_f32(ap + i * 8 + 4);
+            }
+            let out = s.realloc(4, 4);
+            s.write_f32(out, sum);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
         },
     );
+    let prepared = PreparedCall::new(&func, &[ValSpec::Lazy, ValSpec::Lazy]).unwrap();
+    let mut store = Store::new(N * 8 * 4 + 4096);
+    arch.reset_touched();
+    let mut pos_g = ArchetypeColumn::new(&arch, Field::Position);
+    let mut acc_g = ArchetypeColumn::new(&arch, Field::Acceleration);
+    let guest_sum = prepared
+        .bind()
+        .arg_lazy(&mut pos_g)
+        .arg_lazy(&mut acc_g)
+        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
+        .unwrap();
 
-    let mut native_out = vec![0u8; positions.len()];
+    // Native reference in the guest's exact f32 order (pos column, then accel column).
+    let mut native_pa = 0.0f32;
     for i in 0..N {
-        let (nx, ny) = normalize(read_f32(&positions, i * 8), read_f32(&positions, i * 8 + 4));
-        write_f32(&mut native_out, i * 8, nx);
-        write_f32(&mut native_out, i * 8 + 4, ny);
+        native_pa += read_f32(&arch.bytes, i * 24) + read_f32(&arch.bytes, i * 24 + 4);
     }
-    let native_sum = checksum(&native_out);
+    for i in 0..N {
+        native_pa += read_f32(&arch.bytes, i * 24 + 16) + read_f32(&arch.bytes, i * 24 + 20);
+    }
+    assert_eq!(guest_sum, native_pa, "pos+accel projection must match native");
+    assert!(
+        !arch.touched(Field::Velocity),
+        "velocity projected away: never read by either lazy column"
+    );
 
-    let prepared = PreparedCall::new(&func, &[ArgSpec::FlatIn]).unwrap();
-    let mut store = Store::new(N * 8 * 2 + 4096);
+    // --- Lazy-only: a windowed pull gathers ONLY the window (unneeded values are free) ---
+    arch.reset_touched();
+    let mut col_w = ArchetypeColumn::new(&arch, Field::Position);
+    {
+        let mut src = ValSource::Lazy(&mut col_w);
+        let window = drive_lazy(&mut src, &vec2, &[(100, 64)]);
+        assert_eq!(window.len(), 64 * 8, "window is exactly 64 vec2s");
+    }
+    let produced_count = col_w.produced;
+    assert_eq!(produced_count, 64, "only the 64-element window was ever produced");
 
-    // Zero-copy scoped view via the receive primitive: name the sink type (`&[u8]`), the
-    // mirror of naming a source value on the provide side.
-    let scoped_sum = prepared
-        .bind()
-        .arg_flat_in(&positions)
-        .invoke_scoped(&mut store, |results| {
-            let view: &[u8] = results.get(0);
-            checksum(view)
-        })
-        .unwrap();
-
-    // Same result, lifted as a dynamic `Val` instead (per-element) — proving the receive
-    // side lets you pick the representation at the pull site.
-    let val_sum = prepared
-        .bind()
-        .arg_flat_in(&positions)
-        .invoke_scoped(&mut store, |results| match results.val(0) {
-            Val::List(items) => items
-                .iter()
-                .map(|v| match v {
-                    Val::Record(fields) => fields
-                        .iter()
-                        .map(|f| match f {
-                            Val::F32(x) => *x as f64,
-                            _ => unreachable!(),
-                        })
-                        .sum::<f64>(),
-                    _ => unreachable!(),
-                })
-                .sum::<f64>(),
-            _ => unreachable!(),
-        })
-        .unwrap();
-
-    // Owning invoke: no closure, keep the result bytes as host-owned storage, read them
-    // back through the same accessor.
-    let owned = prepared
-        .bind()
-        .arg_flat_in(&positions)
-        .invoke(&mut store)
-        .unwrap();
-    let owned_sum = checksum(owned.results().view(0));
-
-    assert_eq!(native_sum, scoped_sum, "Q2 scoped view must match native");
-    assert_eq!(native_sum, val_sum, "Q2 val-lift must match native");
-    assert_eq!(native_sum, owned_sum, "Q2 owning invoke must match native");
-    println!("  [Q2] host->guest results OK  (checksum {scoped_sum}; scoped view == val == owning invoke)");
+    println!(
+        "  [4 both-worlds] eager==lazy bytes; velocity projected (untouched); \
+         window pulled {produced_count}/{N} only"
+    );
 }
 
-// --- Single-element, pre-lowered vs dynamic (arity is not just lists) -----------------
+// =======================================================================================
+// 5. ValidatedCabiBytes + arena validated once.
+// =======================================================================================
 
-fn demo_single_element() {
-    // A guest taking one `vec2` *by value* (a record, two flattened f32 core params) and
-    // returning its length as a one-element list<f32>.
+fn demo_arena_validity() {
+    // Minting is free for a total type (U32): no sweep, always Ok for well-sized bytes.
+    let u32s: Vec<u8> = (0..8u32).flat_map(|n| n.to_le_bytes()).collect();
+    assert!(ValidatedCabiBytes::checked(&u32s, &Ty::U32).is_ok());
+
+    // Enum(4) is NOT are_all_bit_patterns_valid, so checked() runs the sweep and REJECTS a
+    // discriminant >= 4.
+    assert!(!Ty::Enum(4).are_all_bit_patterns_valid());
+    let good: Vec<u8> = [0u32, 3, 1, 2].iter().flat_map(|n| n.to_le_bytes()).collect();
+    let bad: Vec<u8> = [0u32, 4, 1, 2].iter().flat_map(|n| n.to_le_bytes()).collect();
+    assert!(ValidatedCabiBytes::checked(&good, &Ty::Enum(4)).is_ok());
+    assert!(
+        ValidatedCabiBytes::checked(&bad, &Ty::Enum(4)).is_err(),
+        "out-of-range discriminant must be rejected at the wrapper"
+    );
+
+    // Arena: validate a list<enum> ONCE at absorb time; replay slices with no re-check.
+    let arena = Arena::absorb(good.clone(), Ty::Enum(4)).expect("valid run");
+    assert!(
+        Arena::absorb(bad, Ty::Enum(4)).is_err(),
+        "arena rejects an invalid run at fill time"
+    );
+
+    // A guest sums the discriminants of a replayed arena slice (the conduit's second hop).
     let func = Func::new(
-        vec![vec2_ty()],
-        vec![Ty::List(Box::new(Ty::F32))],
+        vec![Ty::List(Box::new(Ty::Enum(4)))],
+        vec![Ty::List(Box::new(Ty::U32))],
         |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
-            let (x, y) = match (core[0], core[1]) {
-                (CoreVal::F32(x), CoreVal::F32(y)) => (x, y),
-                _ => unreachable!("vec2 flattens to two f32 core params"),
-            };
-            let store = caller.store();
-            let ptr = store.realloc(4, 4);
-            store.write_f32(ptr, (x * x + y * y).sqrt());
-            vec![CoreVal::I32(ptr as i32), CoreVal::I32(1)]
+            let ptr = core[0].as_i32() as usize;
+            let count = core[1].as_i32() as usize;
+            let s = caller.store();
+            let mut sum = 0u32;
+            for i in 0..count {
+                sum = sum.wrapping_add(s.read_u32(ptr + i * 4));
+            }
+            let out = s.realloc(4, 4);
+            s.write_u32(out, sum);
+            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
         },
     );
-
-    let (px, py) = (3.0f32, 4.0f32);
-    let native_len = (px * px + py * py).sqrt();
-
-    // Provide the SAME vec2 two ways: as pre-lowered CABI bytes, and as a dynamic `Val`.
+    let prepared = PreparedCall::new(&func, &[ValSpec::Arena]).unwrap();
     let mut store = Store::new(4096);
-
-    let flat_prepared = PreparedCall::new(&func, &[ArgSpec::FlatIn]).unwrap();
-    let mut vec2_bytes = Vec::new();
-    vec2_bytes.extend_from_slice(&px.to_le_bytes());
-    vec2_bytes.extend_from_slice(&py.to_le_bytes());
-    let flat_len = flat_prepared
+    let sum = prepared
         .bind()
-        .arg_flat_in(&vec2_bytes)
-        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
-        .unwrap();
-
-    let val_prepared = PreparedCall::new(&func, &[ArgSpec::Val]).unwrap();
-    let val_len = val_prepared
-        .bind()
-        .arg_val(Val::Record(vec![Val::F32(px), Val::F32(py)]))
-        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
-        .unwrap();
-
-    assert_eq!(native_len, flat_len, "single pre-lowered value must match native");
-    assert_eq!(native_len, val_len, "single Val must match native");
-    println!("  [1×] single value: pre-lowered bytes == Val  (|(3,4)| = {flat_len})");
-}
-
-// --- All four cells + every representation, in one pipeline --------------------------
-//
-// A single call that mixes bulk and Val on *both* the lowering and lifting sides, in both
-// directions. `scale(pts: list<vec2>, factors: list<f32>) -> (scaled: list<vec2>,
-// mags: list<f32>)`, where the guest forwards everything to a host import:
-//
-//   * host->guest params (lower):   pts as FLAT,  factors as VAL
-//   * guest->host params  (lift):   pts as VIEW,  factors as VAL   (inside the import)
-//   * guest->host results (lower):  scaled as FLAT, mags as VAL    (inside the import)
-//   * host->guest results (lift):   scaled as VIEW, mags as VAL
-
-fn demo_mixed_pipeline() {
-    let pts = initial(0xfeed_face);
-    let factors: Vec<f32> = (0..N).map(|i| 0.5 + (i % 4) as f32 * 0.25).collect();
-
-    let scale_import = HostImport::new(
-        vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
-        vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
-        |ic| {
-            let mut scaled = Vec::with_capacity(N * 8);
-            let mut mags = Vec::with_capacity(N);
-            {
-                let args = ic.args();
-                let pts_bytes = args.view(0); // guest->host param, lifted as a VIEW
-                let factor_vals = match args.val(1) {
-                    // guest->host param, lifted as a VAL
-                    Val::List(items) => items,
-                    _ => unreachable!(),
-                };
-                for (i, chunk) in pts_bytes.chunks_exact(8).enumerate() {
-                    let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-                    let f = match factor_vals[i] {
-                        Val::F32(f) => f,
-                        _ => unreachable!(),
-                    };
-                    let (sx, sy) = (x * f, y * f);
-                    scaled.extend_from_slice(&sx.to_le_bytes());
-                    scaled.extend_from_slice(&sy.to_le_bytes());
-                    mags.push(Val::F32((sx * sx + sy * sy).sqrt()));
-                }
-            } // arg views dropped here, before we take `&mut ic` to set results
-
-            ic.set(0, Source::Flat(&scaled)); // guest->host result, lowered as FLAT
-            ic.set(1, Source::Val(Val::List(mags))); // guest->host result, lowered as VAL
-        },
-    );
-
-    let func = Func::with_imports(
-        vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
-        vec![list_of_vec2(), Ty::List(Box::new(Ty::F32))],
-        vec![scale_import],
-        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| caller.call_import(0, core),
-    );
-
-    // Native reference.
-    let (mut nat_scaled, mut nat_mags) = (vec![0u8; pts.len()], 0.0f64);
-    for (i, &f) in factors.iter().enumerate() {
-        let (x, y) = (read_f32(&pts, i * 8), read_f32(&pts, i * 8 + 4));
-        let (sx, sy) = (x * f, y * f);
-        write_f32(&mut nat_scaled, i * 8, sx);
-        write_f32(&mut nat_scaled, i * 8 + 4, sy);
-        nat_mags += (sx * sx + sy * sy).sqrt() as f64;
-    }
-    let native_sum = checksum(&nat_scaled) + nat_mags;
-
-    let prepared = PreparedCall::new(&func, &[ArgSpec::FlatIn, ArgSpec::Val]).unwrap();
-    let mut store = Store::new(N * 8 * 6 + 8192);
-
-    // host->guest params: pts FLAT, factors VAL.
-    let factors_val = Val::List(factors.iter().map(|&f| Val::F32(f)).collect());
-    let pipeline_sum = prepared
-        .bind()
-        .arg_flat_in(&pts)
-        .arg_val(factors_val)
-        // host->guest results: scaled VIEW, mags VAL.
+        .arg_arena(arena.slice(0, arena.elem_count()))
         .invoke_scoped(&mut store, |r| {
-            let scaled_sum = checksum(r.view(0));
-            let mags_sum = match r.val(1) {
-                Val::List(items) => items
-                    .iter()
-                    .map(|v| match v {
-                        Val::F32(x) => *x as f64,
-                        _ => unreachable!(),
-                    })
-                    .sum::<f64>(),
-                _ => unreachable!(),
-            };
-            scaled_sum + mags_sum
+            u32::from_le_bytes(r.view(0)[0..4].try_into().unwrap())
         })
         .unwrap();
-
-    assert_eq!(native_sum, pipeline_sum, "mixed pipeline must match native");
-    println!("  [mix] all 4 cells, flat+Val both ways OK  (checksum {pipeline_sum})");
+    assert_eq!(sum, 3 + 1 + 2, "replayed arena slice must reach the guest intact");
+    println!("  [5 arena]      ValidatedCabiBytes + validate-once OK  (Σ discriminants {sum})");
 }
 
-// --- Streaming argument source, mixed with flat + Val (#12) --------------------------
+// =======================================================================================
+// 6. Stream — a distinct CM-type node (kept separate per issue #16), mixed with Val + Flat.
+// =======================================================================================
 
-/// Hands a byte buffer out in fixed-size chunks — models an argument delivered incrementally.
+/// Hands a byte buffer out in fixed-size chunks — an argument delivered incrementally.
 struct ChunkProducer<'d> {
     data: &'d [u8],
     chunk_bytes: usize,
     pos: usize,
-}
-
-impl<'d> ChunkProducer<'d> {
-    fn new(data: &'d [u8], chunk_bytes: usize) -> Self {
-        ChunkProducer {
-            data,
-            chunk_bytes,
-            pos: 0,
-        }
-    }
 }
 
 impl Producer for ChunkProducer<'_> {
@@ -417,18 +530,17 @@ impl Producer for ChunkProducer<'_> {
 }
 
 fn demo_stream() {
-    // Guest: accumulate(scale: f32 [Val], seed: list<vec2> [Flat], events: stream<vec2> [Stream])
-    //        -> list<f32> ;  total = Σ seed components + scale · Σ event components.
+    // accumulate(scale: f32 [Val], seed: list<vec2> [Flat], events: stream<vec2> [Stream])
+    //   -> list<f32> ;  total = Σ seed components + scale · Σ event components.
     let func = Func::new(
         vec![Ty::F32, list_of_vec2(), list_of_vec2()],
-        vec![Ty::List(Box::new(Ty::F32))],
+        vec![list_of_f32()],
         |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
             let scale = match core[0] {
                 CoreVal::F32(x) => x,
                 _ => unreachable!("param 0 is scale: f32"),
             };
-            let seed_ptr = core[1].as_i32() as usize;
-            let seed_count = core[2].as_i32() as usize;
+            let (seed_ptr, seed_count) = (core[1].as_i32() as usize, core[2].as_i32() as usize);
             let stream = core[3].as_i32() as usize;
 
             let mut total = 0.0f32;
@@ -447,7 +559,6 @@ fn demo_stream() {
                     off += 8;
                 }
             }
-
             let s = caller.store();
             let out = s.realloc(4, 4);
             s.write_f32(out, total);
@@ -455,112 +566,48 @@ fn demo_stream() {
         },
     );
 
-    let seed = initial(0x5eed_1234);
-    let events = initial(0xe0e0_e0e0);
+    let seed = rng_f32s(0x5eed_1234, N * 2);
+    let events = rng_f32s(0xe0e0_e0e0, N * 2);
     let scale = 0.5f32;
 
-    // Native reference (same operation order as the guest).
-    let mut native_total = 0.0f32;
-    for i in 0..N {
-        native_total += read_f32(&seed, i * 8) + read_f32(&seed, i * 8 + 4);
+    // Native reference, same operation order as the guest.
+    let mut native = 0.0f32;
+    for c in seed.chunks_exact(8) {
+        native += read_f32(c, 0) + read_f32(c, 4);
     }
-    for i in 0..N {
-        native_total += (read_f32(&events, i * 8) + read_f32(&events, i * 8 + 4)) * scale;
+    for c in events.chunks_exact(8) {
+        native += (read_f32(c, 0) + read_f32(c, 4)) * scale;
     }
 
     let prepared =
-        PreparedCall::new(&func, &[ArgSpec::Val, ArgSpec::FlatIn, ArgSpec::Stream]).unwrap();
+        PreparedCall::new(&func, &[ValSpec::Val, ValSpec::ListFlat, ValSpec::Stream]).unwrap();
     let mut store = Store::new(N * 8 * 3 + 8192);
-
-    // The producer feeds `events` in 64-vec2 chunks, pulled during the call. It is borrowed
-    // `&mut` only for the invocation; afterwards it (and `seed`) are free again.
-    let mut producer = ChunkProducer::new(&events, 64 * 8);
-    let sim_total = prepared
+    let vec2 = vec2_ty();
+    let seed_vb = ValidatedCabiBytes::checked(&seed, &vec2).unwrap();
+    let mut producer = ChunkProducer {
+        data: &events,
+        chunk_bytes: 64 * 8,
+        pos: 0,
+    };
+    let total = prepared
         .bind()
         .arg_val(Val::F32(scale)) // Val
-        .arg_flat_in(&seed) // flat
-        .arg_stream(&mut producer) // stream — pulled chunk by chunk during the call
+        .arg_list_flat(seed_vb) // Flat
+        .arg(ValSource::Stream(&mut producer)) // Stream — pulled chunk by chunk during the call
         .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
         .unwrap();
 
-    print!("  arg tiers: ");
-    for (i, tier) in prepared.tiers().iter().enumerate() {
-        print!("arg{i}={tier:?} ");
-    }
-    println!();
-    assert_eq!(native_total, sim_total, "stream + flat + Val mix must match native");
-    println!("  [stream] Val + flat + stream mixed OK  (total {sim_total:.3})");
-}
-
-fn demo_zip_streams() {
-    // Guest: zip_dot(a: stream<vec2>, b: stream<vec2>) -> list<f32>;  total = Σ dot(a[i], b[i]).
-    // Pulls from BOTH streams by handle, in lockstep — the proof that multiple stream args
-    // work: two distinct producers, each borrowed `&mut` for the call, sharing one lifetime.
-    let func = Func::new(
-        vec![list_of_vec2(), list_of_vec2()],
-        vec![Ty::List(Box::new(Ty::F32))],
-        |caller: &mut Caller<'_, '_>, core: &[CoreVal]| {
-            let a = core[0].as_i32() as usize;
-            let b = core[1].as_i32() as usize;
-            let mut total = 0.0f32;
-            loop {
-                // `pull` returns owned `(ptr, len)`, so pulling both in one expression is
-                // fine — each borrow of `caller` ends before the next.
-                match (caller.pull(a), caller.pull(b)) {
-                    (Some((pa, la)), Some((pb, lb))) => {
-                        let s = caller.store();
-                        for i in 0..la.min(lb) / 8 {
-                            let (ax, ay) = (s.read_f32(pa + i * 8), s.read_f32(pa + i * 8 + 4));
-                            let (bx, by) = (s.read_f32(pb + i * 8), s.read_f32(pb + i * 8 + 4));
-                            total += ax * bx + ay * by;
-                        }
-                    }
-                    (None, None) => break,
-                    _ => break, // uneven streams — equal here, so unreachable
-                }
-            }
-            let s = caller.store();
-            let out = s.realloc(4, 4);
-            s.write_f32(out, total);
-            vec![CoreVal::I32(out as i32), CoreVal::I32(1)]
-        },
-    );
-
-    let a_data = initial(0xa0a0_a0a0);
-    let b_data = initial(0xb0b0_b0b0);
-
-    let mut native_total = 0.0f32;
-    for i in 0..N {
-        let (ax, ay) = (read_f32(&a_data, i * 8), read_f32(&a_data, i * 8 + 4));
-        let (bx, by) = (read_f32(&b_data, i * 8), read_f32(&b_data, i * 8 + 4));
-        native_total += ax * bx + ay * by;
-    }
-
-    let prepared =
-        PreparedCall::new(&func, &[ArgSpec::Stream, ArgSpec::Stream]).unwrap();
-    let mut store = Store::new(N * 8 * 3 + 8192);
-
-    // Two independent producers, each borrowed `&mut` for the call, pulled by handle.
-    let mut pa = ChunkProducer::new(&a_data, 64 * 8);
-    let mut pb = ChunkProducer::new(&b_data, 64 * 8);
-    let sim_total = prepared
-        .bind()
-        .arg_stream(&mut pa)
-        .arg_stream(&mut pb)
-        .invoke_scoped(&mut store, |r| read_f32(r.view(0), 0))
-        .unwrap();
-
-    assert_eq!(native_total, sim_total, "zipped two-stream dot product must match native");
-    println!("  [zip]  two streams pulled by handle OK  (dot {sim_total:.3})");
+    assert_eq!(native, total, "Val + Flat + Stream mix must match native");
+    println!("  [6 stream]     Val + Flat + Stream mixed OK  (total {total:.3})");
 }
 
 fn main() {
-    println!("call-builder-sim: canonical-ABI transfer matrix ({N} entities)");
-    demo_params();
-    demo_results();
-    demo_single_element();
-    demo_mixed_pipeline();
+    println!("call-builder-sim: ValSource provide surface ({N} entities)");
+    demo_simple();
+    demo_two_backings();
+    demo_composite();
+    demo_both_worlds();
+    demo_arena_validity();
     demo_stream();
-    demo_zip_streams();
-    println!("  OK: every cell matches its native reference, for both bulk and Val.");
+    println!("  OK: ValSource tree, guest-obliviousness, both worlds, validate-once, and stream all check out.");
 }

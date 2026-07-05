@@ -28,12 +28,19 @@ pub(crate) fn align_up(offset: usize, align: usize) -> usize {
     (offset + align - 1) & !(align - 1)
 }
 
-/// A component-model-ish interface type. Includes a couple of deliberately *non-inline*
-/// shapes (`String`, `Handle`) so the transferability gate has something to reject.
+/// A component-model-ish interface type. Includes a deliberately *non-inline* shape
+/// (`String`, `Handle`) so the inline gate has something to reject, **and** a deliberately
+/// *inline-but-not-total* shape (`Enum`) so the second gate — [`Ty::are_all_bit_patterns_valid`]
+/// — has something to reject too.
 #[derive(Clone, Debug)]
 pub enum Ty {
     F32,
     U32,
+    /// A discriminant in `0..cases`, stored as a 4-byte little-endian integer. **Inline**
+    /// (fixed layout, no out-of-line storage), but **not** `are_all_bit_patterns_valid`:
+    /// a value `>= cases` is a memory-safe byte pattern yet not a valid `Enum` — so a raw
+    /// `memcpy` of untrusted bytes needs a validation sweep. This is property B failing.
+    Enum(u32),
     Record(Vec<Ty>),
     List(Box<Ty>),
     /// (ptr, len) into memory with out-of-line character storage — *not* inline.
@@ -46,7 +53,7 @@ impl Ty {
     /// Canonical-ABI-ish byte size of this type when stored in memory.
     pub fn size(&self) -> usize {
         match self {
-            Ty::F32 | Ty::U32 => 4,
+            Ty::F32 | Ty::U32 | Ty::Enum(_) => 4,
             Ty::Record(fields) => {
                 let mut off = 0;
                 let mut align = 1;
@@ -65,7 +72,7 @@ impl Ty {
 
     pub fn align(&self) -> usize {
         match self {
-            Ty::F32 | Ty::U32 | Ty::Handle => 4,
+            Ty::F32 | Ty::U32 | Ty::Enum(_) | Ty::Handle => 4,
             Ty::Record(fields) => fields.iter().map(Ty::align).max().unwrap_or(1),
             Ty::List(_) | Ty::String => 4,
         }
@@ -79,10 +86,73 @@ impl Ty {
     /// legal. `string`, nested `list`, `resource`/handle all fail it.
     pub fn is_inline(&self) -> bool {
         match self {
-            Ty::F32 | Ty::U32 => true,
+            Ty::F32 | Ty::U32 | Ty::Enum(_) => true,
             Ty::Record(fields) => fields.iter().all(Ty::is_inline),
             Ty::List(_) | Ty::String | Ty::Handle => false,
         }
+    }
+
+    /// **Property B** (issue #16): is *every* bit pattern of this type's fixed-size image a
+    /// *valid* value? When true, a `memcpy` of same-length bytes is not just memory-safe
+    /// (that is [`is_inline`](Self::is_inline)) but *complete* — no validation sweep needed.
+    ///
+    /// `F32`/`U32` are total; `Enum` is not (a discriminant `>= cases` is invalid); a record
+    /// is total iff every field is. Non-inline types can't be bulk-copied at all, so the
+    /// question is moot — reported `false`.
+    pub fn are_all_bit_patterns_valid(&self) -> bool {
+        match self {
+            Ty::F32 | Ty::U32 => true,
+            Ty::Enum(_) => false,
+            Ty::Record(fields) => fields.iter().all(Ty::are_all_bit_patterns_valid),
+            Ty::List(_) | Ty::String | Ty::Handle => false,
+        }
+    }
+
+    /// Validate that `bytes` is a legal canonical image of a **single** value of this inline
+    /// type. `Ok(())` for total types after the O(1) length check; for `Enum` (and records
+    /// containing one) this is the *sweep* that property B's failure forces. Returns the
+    /// offset just past the value on success.
+    fn validate_image(&self, bytes: &[u8], off: usize) -> Result<usize, ValidityError> {
+        match self {
+            Ty::F32 | Ty::U32 => Ok(off + 4),
+            Ty::Enum(cases) => {
+                let d = u32::from_le_bytes(
+                    bytes[off..off + 4].try_into().map_err(|_| ValidityError)?,
+                );
+                if d < *cases {
+                    Ok(off + 4)
+                } else {
+                    Err(ValidityError)
+                }
+            }
+            Ty::Record(fields) => {
+                let mut o = off;
+                for f in fields {
+                    o = align_up(o, f.align());
+                    o = f.validate_image(bytes, o)?;
+                }
+                Ok(align_up(o, self.align()))
+            }
+            Ty::List(_) | Ty::String | Ty::Handle => Err(ValidityError),
+        }
+    }
+
+    /// Validate a whole contiguous `list<self>`-style image (a run of same-typed elements).
+    /// Free (after the length check) when [`are_all_bit_patterns_valid`](Self::are_all_bit_patterns_valid),
+    /// otherwise a linear sweep of every element.
+    fn validate_run(&self, bytes: &[u8]) -> Result<(), ValidityError> {
+        let stride = self.size();
+        if stride == 0 || !bytes.len().is_multiple_of(stride) {
+            return Err(ValidityError);
+        }
+        if self.are_all_bit_patterns_valid() {
+            return Ok(()); // no per-element work — the whole point of property B
+        }
+        let mut off = 0;
+        while off < bytes.len() {
+            off = self.validate_image(bytes, off)?;
+        }
+        Ok(())
     }
 
     /// Byte size of one element of a `list<T>` (or of a scalar treated as its own image).
@@ -116,8 +186,80 @@ impl Ty {
 pub enum Val {
     F32(f32),
     U32(u32),
+    /// A discriminant value for a [`Ty::Enum`]; lowering checks it against the case count.
+    Enum(u32),
     Record(Vec<Val>),
     List(Vec<Val>),
+}
+
+/// Bytes offered as a `Flat`/arena source didn't form a valid canonical image of the
+/// expected type — a bad length, or a discriminant/`Enum` out of range. Raised where the
+/// bytes are *wrapped*, so an invalid image can never reach the lowering fast path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidityError;
+
+/// **Proof-carrying canonical bytes.** The existence of a `ValidatedCabiBytes` is evidence
+/// that its bytes are a valid canonical image of `ty` — so lowering may `memcpy` them with
+/// no further checks. This replaces the earlier `trusted: bool` smell: you cannot fabricate
+/// trust, you can only *earn* it by construction. (Issue #16, Q3: borrowing form.)
+///
+/// Minting is **free** (after a length check) when [`Ty::are_all_bit_patterns_valid`], and a
+/// one-time linear sweep otherwise — exactly the property-B split. Bytes handed back from a
+/// guest arrive already wrapped (the runtime validated them on lift), so feeding one guest's
+/// results straight into another call re-checks nothing.
+#[derive(Clone, Copy)]
+pub struct ValidatedCabiBytes<'a> {
+    bytes: &'a [u8],
+    // The element type whose *run* these bytes encode (a single value is a run of length 1).
+    elem: &'a Ty,
+}
+
+impl<'a> ValidatedCabiBytes<'a> {
+    /// Validate `bytes` as a run of `elem` images. `elem` must be inline.
+    pub fn checked(bytes: &'a [u8], elem: &'a Ty) -> Result<Self, ValidityError> {
+        elem.validate_run(bytes)?;
+        Ok(ValidatedCabiBytes { bytes, elem })
+    }
+
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn elem(&self) -> &'a Ty {
+        self.elem
+    }
+
+    /// Element count = bytes / element stride.
+    pub fn len(&self) -> usize {
+        self.bytes.len() / self.elem.size()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// The **owning** counterpart (Issue #16, Q3). Same proof, but it owns its bytes — what the
+/// [`Arena`] stores, and what lets validated bytes outlive a borrowed source.
+#[derive(Clone)]
+pub struct ValidatedCabiBytesBuf {
+    bytes: Vec<u8>,
+    elem: Ty,
+}
+
+impl ValidatedCabiBytesBuf {
+    pub fn checked(bytes: Vec<u8>, elem: Ty) -> Result<Self, ValidityError> {
+        elem.validate_run(&bytes)?;
+        Ok(ValidatedCabiBytesBuf { bytes, elem })
+    }
+
+    /// Borrow it as a [`ValidatedCabiBytes`] — no re-validation (the proof is preserved).
+    pub fn as_ref(&self) -> ValidatedCabiBytes<'_> {
+        ValidatedCabiBytes {
+            bytes: &self.bytes,
+            elem: &self.elem,
+        }
+    }
 }
 
 /// How the host *provides* a value to be **lowered** into guest memory — the shared
@@ -194,6 +336,14 @@ impl Store {
     }
 
     pub fn write_f32(&mut self, ptr: usize, v: f32) {
+        self.mem[ptr..ptr + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    pub fn read_u32(&self, ptr: usize) -> u32 {
+        u32::from_le_bytes(self.mem[ptr..ptr + 4].try_into().unwrap())
+    }
+
+    pub fn write_u32(&mut self, ptr: usize, v: u32) {
         self.mem[ptr..ptr + 4].copy_from_slice(&v.to_le_bytes());
     }
 }
@@ -475,6 +625,7 @@ impl<'a> Lifted<'a> {
                 CoreVal::I32(x) => Val::F32(f32::from_bits(x as u32)),
             },
             Ty::U32 => Val::U32(self.core[slot].as_i32() as u32),
+            Ty::Enum(_) => Val::Enum(self.core[slot].as_i32() as u32),
             other => panic!("lifting {other:?} to a Val is not modelled"),
         }
     }
@@ -583,6 +734,10 @@ pub(crate) fn lower_val(store: &mut Store, ty: &Ty, val: &Val, core: &mut Vec<Co
     match (ty, val) {
         (Ty::F32, Val::F32(x)) => core.push(CoreVal::F32(*x)),
         (Ty::U32, Val::U32(x)) => core.push(CoreVal::I32(*x as i32)),
+        (Ty::Enum(cases), Val::Enum(d)) => {
+            assert!(d < cases, "enum discriminant {d} out of range (< {cases})");
+            core.push(CoreVal::I32(*d as i32));
+        }
         (Ty::List(elem), Val::List(items)) => {
             let stride = elem.size();
             let ptr = store.realloc(items.len() * stride, elem.align());
@@ -634,7 +789,7 @@ fn lower_flat_image(store: &mut Store, ty: &Ty, bytes: &[u8], core: &mut Vec<Cor
 
 /// Read a single value's canonical memory image out of `bytes` at `off`, flattening it to
 /// core values. Returns the offset just past the value.
-fn flatten_image(ty: &Ty, bytes: &[u8], off: usize, core: &mut Vec<CoreVal>) -> usize {
+pub(crate) fn flatten_image(ty: &Ty, bytes: &[u8], off: usize, core: &mut Vec<CoreVal>) -> usize {
     match ty {
         Ty::F32 => {
             core.push(CoreVal::F32(f32::from_le_bytes(
@@ -642,7 +797,7 @@ fn flatten_image(ty: &Ty, bytes: &[u8], off: usize, core: &mut Vec<CoreVal>) -> 
             )));
             off + 4
         }
-        Ty::U32 => {
+        Ty::U32 | Ty::Enum(_) => {
             core.push(CoreVal::I32(i32::from_le_bytes(
                 bytes[off..off + 4].try_into().unwrap(),
             )));
@@ -664,6 +819,7 @@ fn store_scalar_or_record(store: &mut Store, ty: &Ty, val: &Val, off: usize) {
     match (ty, val) {
         (Ty::F32, Val::F32(x)) => store.write(off, &x.to_le_bytes()),
         (Ty::U32, Val::U32(x)) => store.write(off, &x.to_le_bytes()),
+        (Ty::Enum(_), Val::Enum(d)) => store.write(off, &d.to_le_bytes()),
         (Ty::Record(fields), Val::Record(vals)) => {
             let mut o = off;
             for (fty, fval) in fields.iter().zip(vals) {
@@ -682,6 +838,7 @@ fn lift_scalar_or_record(mem: &[u8], ty: &Ty, off: usize) -> Val {
     match ty {
         Ty::F32 => Val::F32(f32::from_le_bytes(mem[off..off + 4].try_into().unwrap())),
         Ty::U32 => Val::U32(u32::from_le_bytes(mem[off..off + 4].try_into().unwrap())),
+        Ty::Enum(_) => Val::Enum(u32::from_le_bytes(mem[off..off + 4].try_into().unwrap())),
         Ty::Record(fields) => {
             let mut o = off;
             let mut vals = Vec::with_capacity(fields.len());

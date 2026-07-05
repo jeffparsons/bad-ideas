@@ -9,6 +9,18 @@ It is **not** wasmtime. The point isn't performance — it's to answer, with rea
 compiler checks, whether the proposed API ergonomics *compose* across the full transfer
 matrix (and whether the *unsafe* usages are compile errors).
 
+> **Update — the `ValSource` provide surface ([issue #16](https://github.com/jeffparsons/bad-ideas/issues/16)).**
+> The host→guest *provide* side has been rebuilt around a recursive **`ValSource`** tree
+> (`Val | Flat(ValidatedCabiBytes) | Record | List(Flat|Elems) | Stream | Lazy | Arena`),
+> replacing the old top-level `ArgSource`/`ArgSpec`. The load-bearing claim — **one tree,
+> both worlds** (eager today, lazy [#383] tomorrow) — is proven in `src/main.rs`. See
+> [`IMPLEMENTATION-NOTES.md`](./IMPLEMENTATION-NOTES.md) for the decisions and scope cuts;
+> the checklist and matrix below still describe the goals, with `is_inline` now split into
+> `is_cabi_inline` **and** `are_all_bit_patterns_valid` (property A vs B). The receive side
+> (`Lifted`/`get::<T>`) and the guest→host import round-trip are unchanged.
+>
+> [#383]: https://github.com/WebAssembly/component-model/issues/383
+
 ## Design goals
 
 A living checklist — the design, and its future evolutions, should keep satisfying every
@@ -193,9 +205,16 @@ For a concrete proposal of these as real wasmtime types — `Func::prepare_call`
 ## Run it
 
 ```sh
-cargo run     # all four quadrants + the streaming demo; each matches a native reference
-cargo test    # doctests, incl. the three compile_fail borrow-safety proofs
+cargo run     # 6 ValSource demos (simple / two-backings / composite / both-worlds /
+              #   arena-validity / stream); each matches a native reference
+cargo test    # 4 doctests, incl. three compile_fail borrow-safety proofs
+cargo clippy --all-targets   # clean
 ```
+
+The headline demo is **`demo_both_worlds`**: one `ValSource` tree (an archetype AoS column
+via a `Lazy` source) driven **eagerly and lazily**, asserting byte-identical output, that a
+projected-away `velocity` field is *never read*, and that a lazy window pulls only its 64
+elements.
 
 ## Scope
 
