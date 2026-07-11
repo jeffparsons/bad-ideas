@@ -19,6 +19,13 @@ matrix (and whether the *unsafe* usages are compile errors).
 > `is_cabi_inline` **and** `are_all_bit_patterns_valid` (property A vs B). The receive side
 > (`Lifted`/`get::<T>`) and the guest→host import round-trip are unchanged.
 >
+> **DESIGN.md §11** records the decisions adopted (2026-07-11) for reconciling this with
+> *real* Wasmtime and with the maintainer constraint from
+> [wasmtime#13788](https://github.com/bytecodealliance/wasmtime/issues/13788): the engine
+> inversion (`Func::call` rebuilt on the `ValSource` driver), the corrected lift-side
+> trust model for zero-copy views, the in-tree vs embedder-side split (arena out, `Lazy`
+> deferred, `Stream` out of core), and the demo-branch-then-re-land process.
+>
 > [#383]: https://github.com/WebAssembly/component-model/issues/383
 
 ## Design goals

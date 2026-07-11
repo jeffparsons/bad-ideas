@@ -782,3 +782,100 @@ Q1 validate the reusable `ValSpec` **shape** once at `prepare` (implemented). Q2
 (`ValidatedCabiBytesBuf`) and borrowing (`ValidatedCabiBytes`) wrappers (implemented).
 
 [component-model#383]: https://github.com/WebAssembly/component-model/issues/383
+
+## 11. Reconciling with real Wasmtime (adopted 2026-07-11)
+
+Decisions adopted after reviewing Alex Crichton's constraint on [wasmtime#13788]
+("build the currently-existing `Func::call` on top of it; don't add a third way to call
+functions") against the actual Wasmtime internals and Jeff's `component-prepare-call`
+prototype branch (jeffparsons/wasmtime).
+
+### 11.1 The engine inversion (the constraint, taken as a requirement)
+
+What Wasmtime's typed and dynamic paths already share is the true engine substrate:
+`Func::call_raw`, `LowerContext`/`LiftContext`, `post_return` sequencing, and the
+flat-vs-memory decision at `MAX_FLAT_PARAMS`. What they do **not** share is the
+argument-walking layer, which exists twice today — trait-based (`typed.rs`,
+generated `Lower`/`Lift` impls) and `Val`-based (`values.rs`: `Val::lower/store/lift/load`).
+The v1 prototype added a **third** walker (`prepared.rs`'s `lower_sources`/`store_sources`,
+self-describedly "mirroring `Func::lower_args`") — precisely the shape the constraint
+forbids. The adopted plan **inverts** it:
+
+- the `ValSource`-walking driver becomes *the* dynamic walker, **replacing** the
+  `values.rs` traversal (with `Val` as one leaf strategy of the driver);
+- `Func::call(&[Val])` is reimplemented as the all-`Val` degenerate tree over
+  `prepare_call`/`bind`/`invoke_scoped` — no intended behavior change, existing tests
+  as the safety net;
+- `TypedFunc` stays the monomorphized specialization over the shared substrate; forcing
+  generated `Lower` impls through a dynamically-dispatched driver would forfeit the
+  static path's whole advantage. (Confirming this split matches Alex's ideal is an open
+  question posed upstream.)
+
+Net dynamic walkers: two today → **one**. A side dividend to surface upstream: Wasmtime
+already has redundant "flat/POD" classifications (`FlatAbi` in `futures_and_streams.rs`
+vs the new predicates, plus `interface_type_all_bit_patterns_valid` duplicating
+`Type::are_all_bit_patterns_valid` in the prototype) and multiple bulk-copy fast paths
+(the stream `copy<T>` memcpy, string lowering, `lower_flat_list`) — and a standing
+`FIXME` (`typed.rs:1705`) that even typed `Vec<u8>` list lowering isn't a true memcpy.
+Consolidating onto one classification + one checked bulk-copy primitive makes this work
+*reduce* critical surface, which is the strongest answer to the maintainer's actual worry.
+
+### 11.2 Lift-side trust model, corrected
+
+The §10-era claim "guest-produced canonical data is validated by the runtime on lift, so
+`view` returns `ValidatedCabiBytes`" is **wrong against real Wasmtime**: validation
+happens only as a side effect of materializing `Val`s; a zero-copy view lifts nothing,
+so nothing has checked e.g. enum discriminants sitting in guest memory. Adopted rule:
+`view` hands back proof-carrying bytes for free on `are_all_bit_patterns_valid` element
+types (validity vacuous — what the v1 prototype gated on), **and Wasmtime itself ships
+the checked view** for inline-but-not-total types — an opt-in O(n) sweep that mints
+`ValidatedCabiBytes`. We *advocate* for the checked layer upstream rather than merely
+offering it as an option: the sweep has to live somewhere, and if Wasmtime doesn't
+provide it, embedders wanting zero-copy `list<enum>` reads will hand-roll canonical-ABI
+validation themselves, badly — safety-relevant logic that belongs next to the code that
+defines validity, where the proof type also can't be forged. This supersedes the
+earlier "runtime already validated on lift" statement in issue #16.
+
+### 11.3 Type identity across instances
+
+`ValidatedCabiBytes` must carry the real `component::Type` handle (not a toy tag), and
+the A→B conduit's structural type-equality check (A's result element type vs B's
+parameter type) happens at **`bind`**, using Wasmtime's existing type-equality
+machinery. `PreparedCall` is pinned to a store/instance identity. NaN canonicalization
+on raw-copied floats remains explicitly out of scope (documented, not silent).
+
+### 11.4 In-tree vs embedder-side (the extensibility split)
+
+The runtime owns only the checked lowering **driver**; third parties extend at the
+leaves:
+
+- **`Arena` — out of the Wasmtime surface entirely.** A pre-validated arena slice is
+  just a container of `ValidatedCabiBytes`; arenas live embedder-side (e.g. in the ECS
+  host). Wasmtime *could* ship one as a helper; it doesn't have to.
+- **`Lazy` — the enum variant (a trait-object leaf) is the extension point**, but it's
+  deferred from the initial upstream ask; concrete producers (strided column gathers,
+  …) are embedder code, and the variant lands additively when CM lazy value lowering
+  ([component-model#383]) or a concrete need earns it.
+- **`Stream` — out of the core proposal.** Real `stream<T>` params are handles with
+  their own concurrent API (`futures_and_streams.rs`); the per-call `&mut dyn Producer`
+  model is a poor fit for it. Revisit against the real concurrent machinery.
+- **Async is an acknowledged open question**: component async now runs through
+  `run_concurrent`-style APIs; how a `BoundCall`'s whole-call borrows interact with
+  concurrent calls must be answered before the relevant PR, not designed here.
+
+### 11.5 Process: demo branch, then re-land
+
+Build the whole implementation end-to-end on one branch of the wasmtime fork and open
+it as a **draft PR explicitly marked demo-not-for-merge**, so feedback lands on concrete
+code and upstream CI backs the no-behavior-change claim. Keep the commit sequence
+aligned with the intended landing boundaries so it re-lands afterwards as small PRs:
+(1) engine inversion + `Func::call` rebuilt on the driver; (2) minimal public surface
+(`Val` + `Flat`/`ListFlat` sources, `is_cabi_inline` + `are_all_bit_patterns_valid`,
+`ValidatedCabiBytes`, `prepare_call`/`bind`/`invoke`/`invoke_scoped`); (3) per-node
+`Record`/`ListElems` mixing; (4) richer result accessors / the guest→guest conduit.
+The v1 prototype branch (`component-prepare-call`) is superseded — salvage its
+predicates, `lower_flat_list` realloc+memcpy core, `invoke_scoped`/post-return
+sequencing, and especially its tests, but rework into the inverted form on a fresh
+branch off synced upstream.
+
+[wasmtime#13788]: https://github.com/bytecodealliance/wasmtime/issues/13788

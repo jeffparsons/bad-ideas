@@ -20,5 +20,6 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Personal upstream-proposal draft — deliberately never committed (see CLAUDE.md)
+# Personal upstream-proposal drafts — deliberately never committed (see CLAUDE.md)
 /api-proposal-comment-do-not-commit.md
+/api-proposal-comment-v2-do-not-commit.md
